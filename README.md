@@ -90,6 +90,8 @@ Contributions, issues, and feature requests are welcome!
 
 - [Group Policy Preferences Documentation](https://docs.microsoft.com/en-us/previous-versions/windows/desktop/grouppolicy/group-policy-preferences)
 
+- [MS14-025: Vulnerability in Group Policy Preferences could allow elevation of privilege: May 13, 2014](https://support.microsoft.com/en-us/topic/ms14-025-vulnerability-in-group-policy-preferences-could-allow-elevation-of-privilege-may-13-2014-60734e15-af79-26ca-ea53-8cd617073c30)
+
 ## Changelog
 
 ### Version 1.0 (2026-01-17)

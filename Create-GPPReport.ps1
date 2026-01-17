@@ -101,6 +101,7 @@ $results = [ordered]@{
     Users = New-Object System.Collections.Generic.List[object]
     Files = New-Object System.Collections.Generic.List[object]
     Folders = New-Object System.Collections.Generic.List[object]
+    FoldersACL = New-Object System.Collections.Generic.List[object]
     IniFiles = New-Object System.Collections.Generic.List[object]
     NetworkShares = New-Object System.Collections.Generic.List[object]
     DataSources = New-Object System.Collections.Generic.List[object]
@@ -251,11 +252,15 @@ foreach ($file in $xmlFiles) {
                 if ($null -eq $n) { continue }
                 $props = $n.ChildNodes | Where-Object { $_.Name -eq 'Properties' } | Select-Object -First 1
                 if ($props) {
+                    $securityFinding = ''
+                    if ($n.cpassword) {
+                        $securityFinding = "Stored credentials detected - Password in SYSVOL (AES-encrypted)"
+                    }
                     Add-Item 'Drives' @{
                         Domain=$domain; GPO=$gpo; Config=$config;
                         DriveLetter=$props.letter; Path=$props.path; Label=$props.label;
                         UserName=$props.userName; Persistent=$props.persistent; UseLetter=$props.useLetter;
-                        Action=$props.action
+                        Action=$props.action; SecurityFinding=$securityFinding
                     }
                 }
             }
@@ -290,11 +295,32 @@ foreach ($file in $xmlFiles) {
                 if ($null -eq $n) { continue }
                 $props = $n.Properties
                 if ($props) {
+                    $securityFinding = ''
+                    $regKey = $props.key.ToLower()
+                    $regName = $props.name.ToLower()
+                    # Detect insecure registry settings
+                    if ($regKey -match 'winlogon' -and $regName -eq 'autoadminlogon') {
+                        $securityFinding = 'Insecure: AutoAdminLogon enabled - cleartext password may be stored'
+                    } elseif ($regKey -match 'winlogon' -and $regName -eq 'defaultpassword') {
+                        $securityFinding = 'Insecure: Plaintext password stored in registry'
+                    } elseif ($regKey -match 'terminal' -and ($regName -match 'security' -or $regName -match 'nla')) {
+                        if ($props.value -eq '0') {
+                            $securityFinding = 'Insecure: RDP Network Level Authentication disabled'
+                        }
+                    } elseif ($regKey -match 'firewall' -and ($regName -match 'enabled' -or $regName -match 'firewall')) {
+                        if ($props.value -eq '0') {
+                            $securityFinding = 'Critical: Windows Firewall disabled'
+                        }
+                    } elseif ($regKey -match 'uac' -and $regName -match 'enableuac') {
+                        if ($props.value -eq '0') {
+                            $securityFinding = 'Critical: User Account Control (UAC) disabled'
+                        }
+                    }
                     Add-Item 'Registry' @{
                         Domain=$domain; GPO=$gpo; Config=$config;
                         Hive=$props.hive; RegistryKey=$props.key; ValueName=$props.name;
                         ValueData=$props.value; ValueType=$props.type; Action=$props.action;
-                        DisplayDecimal=$props.displayDecimal; Default=$props.default
+                        DisplayDecimal=$props.displayDecimal; Default=$props.default; SecurityFinding=$securityFinding
                     }
                 }
             }
@@ -305,10 +331,15 @@ foreach ($file in $xmlFiles) {
                 if ($null -eq $n) { continue }
                 $props = $n.Properties
                 if ($props) {
+                    $securityFinding = ''
+                    if ($n.cpassword) {
+                        $securityFinding = "Stored printer credentials detected - Password in SYSVOL (AES-encrypted)"
+                    }
                     Add-Item 'Printers' @{
                         Domain=$domain; GPO=$gpo; Config=$config;
                         PrinterName=$n.name; Path=$props.path; Comment=$props.comment;
-                        Location=$props.location; Port=$props.port; Action=$props.action
+                        Location=$props.location; Port=$props.port; Action=$props.action;
+                        SecurityFinding=$securityFinding
                     }
                 }
             }
@@ -335,6 +366,10 @@ foreach ($file in $xmlFiles) {
                 if ($null -eq $n) { continue }
                 $props = $n.Properties
                 if ($props) {
+                    $securityFinding = ''
+                    if ($props.groupName -eq 'Administrators' -or $props.groupName -match 'Admin') {
+                        $securityFinding = "Local admin group managed via GPP - High privilege modification risk"
+                    }
                     $members = @()
                     if ($props.Members.Member) {
                         $members = @($props.Members.Member)
@@ -343,7 +378,7 @@ foreach ($file in $xmlFiles) {
                     Add-Item 'GroupsDetail' @{
                         Domain=$domain; GPO=$gpo; Config=$config;
                         GroupName=$props.groupName; Description=$props.description;
-                        GroupSID=$props.groupSID; SID=$n.sid; GroupAction=$props.action; Changed=$n.changed
+                        GroupSID=$props.groupSID; SID=$n.sid; GroupAction=$props.action; Changed=$n.changed; SecurityFinding=$securityFinding
                     }
                     # If no members, create one record for the group without member info
                     if ($members.Count -eq 0) {
@@ -351,7 +386,7 @@ foreach ($file in $xmlFiles) {
                             Domain=$domain; GPO=$gpo; Config=$config;
                             GroupName=$props.groupName; Description=$props.description;
                             MemberName=''; MemberAction=''; MemberSID='';
-                            GroupAction=$props.action
+                            GroupAction=$props.action; SecurityFinding=$securityFinding
                         }
                     } else {
                         # Create a record for each member
@@ -360,7 +395,7 @@ foreach ($file in $xmlFiles) {
                                 Domain=$domain; GPO=$gpo; Config=$config;
                                 GroupName=$props.groupName; Description=$props.description;
                                 MemberName=$member.name; MemberAction=$member.action; MemberSID=$member.sid;
-                                GroupAction=$props.action
+                                GroupAction=$props.action; SecurityFinding=$securityFinding
                             }
                         }
                     }
@@ -372,13 +407,17 @@ foreach ($file in $xmlFiles) {
                 if ($null -eq $u) { continue }
                 $props = $u.Properties
                 if ($props) {
+                    $securityFinding = ''
+                    if ($u.cpassword) {
+                        $securityFinding = "Local user with stored password in SYSVOL (AES-encrypted) - Credential exposure risk"
+                    }
                     Add-Item 'Users' @{
                         Domain=$domain; GPO=$gpo; Config=$config;
                         UserName=$props.userName; FullName=$props.fullName;
                         Description=$props.description; Action=$props.action;
                         NeverExpires=$props.neverExpires; AccountDisabled=$props.acctDisabled;
                         ChangeLogon=$props.changeLogon; NoChange=$props.noChange;
-                        Changed=$u.changed
+                        Changed=$u.changed; SecurityFinding=$securityFinding
                     }
                 }
             }
@@ -412,6 +451,26 @@ foreach ($file in $xmlFiles) {
                         DeleteSubFolders=$props.deleteSubFolders; DeleteFiles=$props.deleteFiles;
                         DeleteReadOnly=$props.deleteReadOnly; ReadOnly=$props.readOnly;
                         Archive=$props.archive; Hidden=$props.hidden
+                    }
+                    # Extract ACL information if present
+                    if ($props.ACL -and $props.ACL.ACE) {
+                        $aces = @($props.ACL.ACE)
+                        foreach ($ace in $aces) {
+                            $securityFinding = ''
+                            $principal = $ace.principal.ToLower()
+                            $rights = $ace.rights.ToLower()
+                            # Detect overly permissive ACLs
+                            if (($principal -match 'everyone|authenticated users|system' -or $principal -eq 's-1-1-0') -and ($rights -match 'full|modify')) {
+                                $securityFinding = "Overly permissive ACL: $($ace.principal) has $($ace.rights) rights"
+                            }
+                            Add-Item 'FoldersACL' @{
+                                Domain=$domain; GPO=$gpo; Config=$config;
+                                FolderName=$n.name; FolderPath=$props.path;
+                                ACEType=$ace.type; Principal=$ace.principal;
+                                Rights=$ace.rights; Inheritance=$ace.inheritance;
+                                FolderAction=$props.action; Changed=$n.changed; SecurityFinding=$securityFinding
+                            }
+                        }
                     }
                 }
             }
@@ -453,12 +512,16 @@ foreach ($file in $xmlFiles) {
                 if ($null -eq $n) { continue }
                 $props = $n.Properties
                 if ($props) {
+                    $securityFinding = ''
+                    if ($n.cpassword) {
+                        $securityFinding = "ODBC stored credentials - Password in SYSVOL (AES-encrypted)"
+                    }
                     Add-Item 'DataSources' @{
                         Domain=$domain; GPO=$gpo; Config=$config;
                         DataSourceName=$n.name; DSN=$props.dsn; Driver=$props.driver;
                         Description=$props.description; UserName=$props.username;
                         Action=$props.action; UserDSN=$props.userDSN; UserContext=$n.userContext;
-                        Changed=$n.changed
+                        Changed=$n.changed; SecurityFinding=$securityFinding
                     }
                 }
             }
@@ -639,7 +702,8 @@ foreach ($file in $xmlFiles) {
                         ExecutionTimeLimit=$execTimeLimit; RunLevel=$runLevel;
                         TriggerType=$triggerType; Command=$command;
                         Arguments=$arguments; WorkingDirectory=$workingDir;
-                        Changed=$n.changed; UID=$n.uid
+                        Changed=$n.changed; UID=$n.uid;
+                        SecurityFinding = if ($n.cpassword) { "Scheduled task with stored credentials - Password in SYSVOL (AES-encrypted)" } else { '' }
                     }
                 }
             }
@@ -650,11 +714,15 @@ foreach ($file in $xmlFiles) {
                 if ($null -eq $n) { continue }
                 $props = $n.Properties
                 if ($props) {
+                    $securityFinding = ''
+                    if ($n.cpassword) {
+                        $securityFinding = "Service with stored credentials - Password in SYSVOL (AES-encrypted)"
+                    }
                     Add-Item 'Services' @{
                         Domain=$domain; GPO=$gpo; Config=$config;
                         ServiceName=$props.serviceName; DisplayName=$n.name;
                         StartupType=$props.startupType; Timeout=$props.timeout;
-                        Changed=$n.changed; UID=$n.uid; Action=$n.action
+                        Changed=$n.changed; UID=$n.uid; Action=$n.action; SecurityFinding=$securityFinding
                     }
                 }
             }
@@ -668,7 +736,7 @@ foreach ($file in $xmlFiles) {
 Write-Host "" -ForegroundColor Cyan
 Write-Host "Exporting CSV files..." -ForegroundColor Cyan
 if ($ExportCSV) {
-    $csvFiles = @('Drives','Registry','Printers','Shortcuts','GroupsDetail','Groups','Users','Files','Folders','IniFiles','NetworkShares','DataSources','Devices','EnvironmentVariables','InternetSettings','PowerOptions','FolderOptions','Services','ScheduledTasks','OtherTypes')
+    $csvFiles = @('Drives','Registry','Printers','Shortcuts','GroupsDetail','Groups','Users','Files','Folders','FoldersACL','IniFiles','NetworkShares','DataSources','Devices','EnvironmentVariables','InternetSettings','PowerOptions','FolderOptions','Services','ScheduledTasks','OtherTypes')
     $totalCsvFiles = $csvFiles.Count
     
     $csvIndex = 0
@@ -684,6 +752,7 @@ if ($ExportCSV) {
             'Users' { 'GPP_Users_Details.csv' }
             'Files' { 'GPP_Files_Details.csv' }
             'Folders' { 'GPP_Folders_Details.csv' }
+            'FoldersACL' { 'GPP_FoldersACL_Details.csv' }
             'IniFiles' { 'GPP_IniFiles_Details.csv' }
             'NetworkShares' { 'GPP_NetworkShares_Details.csv' }
             'DataSources' { 'GPP_DataSources_Details.csv' }
@@ -749,6 +818,12 @@ $uniqueDomains = @($allRecords | Select-Object -ExpandProperty Domain -Unique | 
 $uniqueGPOs = @($allGpos | Select-Object Domain, GPO -Unique).Count
 $gposWithPrefs = @($allRecords | Select-Object Domain, GPO -Unique | Where-Object {$_.Domain}).Count
 
+# Count risky configurations (non-empty SecurityFinding entries)
+$riskyConfigs = 0
+@($results.Drives, $results.Registry, $results.Printers, $results.Groups, $results.GroupsDetail, $results.Users, $results.DataSources, $results.FoldersACL, $results.ScheduledTasks, $results.Services) | ForEach-Object {
+    $riskyConfigs += @($_ | Where-Object { $_.SecurityFinding -and $_.SecurityFinding -ne '' }).Count
+}
+
 # Build preference type breakdown
 $prefTypeStats = @()
 $prefTypeMap = @(
@@ -798,6 +873,7 @@ $summary = @(
     @{Name='Local Users'; Data=$results.Users},
     @{Name='Files'; Data=$results.Files},
     @{Name='Folders'; Data=$results.Folders},
+    @{Name='Folders ACL'; Data=$results.FoldersACL},
     @{Name='INI Files'; Data=$results.IniFiles},
     @{Name='Network Shares'; Data=$results.NetworkShares},
     @{Name='Data Sources'; Data=$results.DataSources},
@@ -831,6 +907,7 @@ if ($ExportJSON) {
             TotalGPOs = $uniqueGPOs
             GPOsWithPreferences = $gposWithPrefs
             TotalPreferenceRecords = $totalRecords
+            RiskyConfigurations = $riskyConfigs
         }
         PreferenceTypeDistribution = @{
             WindowsSettings = @($prefTypeStats | Where-Object { $_.Category -eq 'Windows' } | ForEach-Object {
@@ -870,13 +947,27 @@ function Build-Section($title,$id,$data,$columns,$filterId,$tableId) {
         [void]$sb.Append("<div class='filter'><input id='$filterId' onkeyup=`"filterTable('$filterId','$tableId')`" placeholder='Filter...'></div>")
     }
     [void]$sb.Append("<table id='$tableId'><tr>")
-    foreach ($c in $columns) { [void]$sb.Append("<th>$c</th>") }
+    foreach ($c in $columns) {
+        if ($c -eq 'SecurityFinding') {
+            [void]$sb.Append("<th class='security-header'></th>")
+        } else {
+            [void]$sb.Append("<th>$c</th>")
+        }
+    }
     [void]$sb.Append("</tr>")
     foreach ($row in ($data | Select-Object -First 500)) {
         [void]$sb.Append("<tr>")
         foreach ($c in $columns) {
             $val = EncodeHtml $row.$c
-            [void]$sb.Append("<td>$val</td>")
+            if ($c -eq 'CPassword' -and $val) {
+                [void]$sb.Append("<td class='cpassword-cell'></td>")
+            } elseif ($c -eq 'SecurityFinding' -and $val) {
+                [void]$sb.Append("<td class='security-cell' title='$val'>⚠️</td>")
+            } elseif ($c -eq 'SecurityFinding') {
+                [void]$sb.Append("<td class='security-cell'></td>")
+            } else {
+                [void]$sb.Append("<td>$val</td>")
+            }
         }
         [void]$sb.Append("</tr>")
     }
@@ -892,13 +983,25 @@ function Build-SubSection($title,$data,$columns,$filterId,$tableId) {
         [void]$sb.Append("<div class='filter'><input id='$filterId' onkeyup=`"filterTable('$filterId','$tableId')`" placeholder='Filter...'></div>")
     }
     [void]$sb.Append("<table id='$tableId'><tr>")
-    foreach ($c in $columns) { [void]$sb.Append("<th>$c</th>") }
+    foreach ($c in $columns) {
+        if ($c -eq 'SecurityFinding') {
+            [void]$sb.Append("<th class='security-header'></th>")
+        } else {
+            [void]$sb.Append("<th>$c</th>")
+        }
+    }
     [void]$sb.Append("</tr>")
     foreach ($row in ($data | Select-Object -First 500)) {
         [void]$sb.Append("<tr>")
         foreach ($c in $columns) {
             $val = EncodeHtml $row.$c
-            [void]$sb.Append("<td>$val</td>")
+            if ($c -eq 'SecurityFinding' -and $val) {
+                [void]$sb.Append("<td class='security-cell' title='$val'>⚠️</td>")
+            } elseif ($c -eq 'SecurityFinding') {
+                [void]$sb.Append("<td class='security-cell'></td>")
+            } else {
+                [void]$sb.Append("<td>$val</td>")
+            }
         }
         [void]$sb.Append("</tr>")
     }
@@ -911,10 +1014,11 @@ $report = Join-Path $OutputDir "Group Policy Preferences Report_$(Get-Date -Form
 $html = @"
 <!DOCTYPE html>
 <html><head><meta charset='UTF-8'><title>Group Policy Preferences Report</title>
-<style>body{font-family:Segoe UI,Arial,sans-serif;background:#f5f5f5;margin:0;} .header{background:linear-gradient(135deg,#0078d4,#106ebe);color:#fff;padding:26px;text-align:center;} .header a{color:#fff;text-decoration:none;border:1px solid rgba(255,255,255,.4);padding:6px 14px;border-radius:4px;display:inline-block;margin-top:8px;font-size:13px;transition:all .2s;} .header a:hover{background:rgba(255,255,255,.15);border-color:#fff;} .container{max-width:1650px;margin:0 auto;padding:18px;display:flex;flex-direction:column;gap:24px;} .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin:18px 0;} .card{background:#fff;padding:18px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,.12);} .card h3{margin:0;color:#0078d4;} .value{font-size:30px;font-weight:700;color:#0078d4;} .pref-section{display:flex;gap:24px;margin:18px 0;} .pref-section-col{flex:1;} .pref-section-col h3{margin:0 0 12px 0;color:#0078d4;font-size:16px;font-weight:600;} .pref-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;} .pref-card{background:#fff;padding:14px;border-radius:6px;border-left:4px solid #0078d4;box-shadow:0 1px 3px rgba(0,0,0,.1);} .pref-card h4{margin:0 0 8px 0;color:#0078d4;font-size:13px;text-transform:uppercase;} .pref-card .pref-value{font-size:20px;font-weight:700;color:#106ebe;display:flex;align-items:baseline;gap:6px;} .pref-card .pref-sub{font-size:11px;font-weight:600;color:#666;} table{width:100%;border-collapse:collapse;margin:12px 0;font-size:13px;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.1);table-layout:auto;} th{background:#0078d4;color:#fff;padding:9px 7px;text-align:left;position:sticky;top:0;word-break:break-word;white-space:nowrap;overflow-wrap:anywhere;} td{padding:8px 7px;border-bottom:1px solid #e5e5e5;word-break:break-word;overflow-wrap:anywhere;} tr:nth-child(even){background:#f8f9fa;} tr:hover{background:#e9f3ff;} #driveTable td:nth-child(5),#driveTable td:nth-child(6){max-width:200px;} #regTable td:nth-child(7){max-width:350px;} #printerTable td:nth-child(5){max-width:200px;} #shortcutTable td:nth-child(5),#shortcutTable td:nth-child(6){max-width:200px;} #filesTable td:nth-child(5),#filesTable td:nth-child(6){max-width:200px;} #foldersTable td:nth-child(4),#foldersTable td:nth-child(5){max-width:200px;} #inifilesTable td:nth-child(4),#inifilesTable td:nth-child(5){max-width:200px;} #networksharesTable td:nth-child(4),#networksharesTable td:nth-child(5){max-width:200px;} #datasourcesTable td:nth-child(5),#datasourcesTable td:nth-child(6){max-width:200px;} #devicesTable td:nth-child(4){max-width:200px;} #inetTable td:nth-child(6){max-width:250px;} #tasksTable td:nth-child(5),#tasksTable td:nth-child(12){max-width:200px;} #powerTable td:nth-child(4){max-width:200px;} #folderoptTable td:nth-child(4){max-width:200px;} details{margin:20px 0;background:#fff;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,.1);} details[open]{box-shadow:0 2px 8px rgba(0,0,0,.15);} summary{cursor:pointer;padding:16px;background:#f8f9fa;border-radius:6px;font-weight:600;color:#0078d4;user-select:none;display:flex;justify-content:space-between;align-items:center;} summary:hover{background:#e9f3ff;} details[open]>summary{background:#0078d4;color:#fff;border-radius:6px 6px 0 0;} .section{display:block;padding:0;width:100%;} .filter input{padding:7px 9px;width:280px;border:1px solid #ccc;border-radius:4px;} .filter{padding:12px 16px;border-top:1px solid #e5e5e5;} .main-section{background:#fff;padding:24px;border-radius:8px;margin-bottom:30px;box-shadow:0 2px 8px rgba(0,0,0,.1);} .main-section h1{color:#0078d4;margin:0 0 20px 0;padding-bottom:12px;border-bottom:3px solid #0078d4;font-size:24px;}</style>
+<style>body{font-family:Segoe UI,Arial,sans-serif;background:#f5f5f5;margin:0;position:relative;} .github-corner{position:fixed;top:0;right:0;z-index:9999;} .github-corner svg{fill:#0078d4;color:#fff;width:80px;height:80px;} .github-corner:hover svg{fill:#106ebe;} .github-corner .octo-arm{transform-origin:130px 106px;} .github-corner:hover .octo-arm{animation:octocat-wave 560ms ease-in-out;} @keyframes octocat-wave{0%,100%{transform:rotate(0)}20%,60%{transform:rotate(-25deg)}40%,80%{transform:rotate(10deg)}} .header{background:linear-gradient(135deg,#0078d4,#106ebe);color:#fff;padding:26px;text-align:center;} .container{max-width:1650px;margin:0 auto;padding:18px;display:flex;flex-direction:column;gap:24px;} .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin:18px 0;} .card{background:#fff;padding:18px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,.12);} .card h3{margin:0;color:#0078d4;} .value{font-size:30px;font-weight:700;color:#0078d4;} .pref-section{display:flex;gap:24px;margin:18px 0;} .pref-section-col{flex:1;} .pref-section-col h3{margin:0 0 12px 0;color:#0078d4;font-size:16px;font-weight:600;} .pref-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;} .pref-card{background:#fff;padding:14px;border-radius:6px;border-left:4px solid #0078d4;box-shadow:0 1px 3px rgba(0,0,0,.1);} .pref-card h4{margin:0 0 8px 0;color:#0078d4;font-size:13px;text-transform:uppercase;} .pref-card .pref-value{font-size:20px;font-weight:700;color:#106ebe;display:flex;align-items:baseline;gap:6px;} .pref-card .pref-sub{font-size:11px;font-weight:600;color:#666;} table{width:100%;border-collapse:collapse;margin:12px 0;font-size:13px;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.1);table-layout:auto;} th{background:#0078d4;color:#fff;padding:9px 7px;text-align:left;position:sticky;top:0;word-break:break-word;white-space:nowrap;overflow-wrap:anywhere;} th.security-header{background:#0078d4;} td{padding:8px 7px;border-bottom:1px solid #e5e5e5;word-break:break-word;overflow-wrap:anywhere;} tr:nth-child(even){background:#f8f9fa;} tr:hover{background:#e9f3ff;} .security-cell{background-color:#fff3cd !important;color:#856404;font-weight:600;cursor:pointer;} #driveTable td:nth-child(5),#driveTable td:nth-child(6),#driveTable td:nth-child(10){max-width:200px;} #regTable td:nth-child(7){max-width:350px;} #printerTable td:nth-child(5),#printerTable td:nth-child(10){max-width:200px;} #shortcutTable td:nth-child(5),#shortcutTable td:nth-child(6){max-width:200px;} #filesTable td:nth-child(5),#filesTable td:nth-child(6){max-width:200px;} #foldersTable td:nth-child(4),#foldersTable td:nth-child(5){max-width:200px;} #folderaclTable td:nth-child(2),#folderaclTable td:nth-child(4){max-width:250px;} #inifilesTable td:nth-child(4),#inifilesTable td:nth-child(5){max-width:200px;} #networksharesTable td:nth-child(4),#networksharesTable td:nth-child(5){max-width:200px;} #datasourcesTable td:nth-child(5),#datasourcesTable td:nth-child(6),#datasourcesTable td:nth-child(10){max-width:200px;} #usersTable td:nth-child(10){max-width:200px;} #devicesTable td:nth-child(4){max-width:200px;} #inetTable td:nth-child(6){max-width:250px;} #tasksTable td:nth-child(5),#tasksTable td:nth-child(12){max-width:200px;} #tasksTable td:nth-child(12){max-width:200px;} #powerTable td:nth-child(4){max-width:200px;} #folderoptTable td:nth-child(4){max-width:200px;} #servicesTable td:nth-child(9){max-width:200px;} details{margin:20px 0;background:#fff;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,.1);} details[open]{box-shadow:0 2px 8px rgba(0,0,0,.15);} summary{cursor:pointer;padding:16px;background:#f8f9fa;border-radius:6px;font-weight:600;color:#0078d4;user-select:none;display:flex;justify-content:space-between;align-items:center;} summary:hover{background:#e9f3ff;} details[open]>summary{background:#0078d4;color:#fff;border-radius:6px 6px 0 0;} .section{display:block;padding:0;width:100%;} .filter input{padding:7px 9px;width:280px;border:1px solid #ccc;border-radius:4px;} .filter{padding:12px 16px;border-top:1px solid #e5e5e5;} .main-section{background:#fff;padding:24px;border-radius:8px;margin-bottom:30px;box-shadow:0 2px 8px rgba(0,0,0,.1);} .main-section h1{color:#0078d4;margin:0 0 20px 0;padding-bottom:12px;border-bottom:3px solid #0078d4;font-size:24px;}</style>
 <script>function filterTable(i,t){const v=document.getElementById(i).value.toUpperCase();const r=document.getElementById(t).getElementsByTagName('tr');for(let x=1;x<r.length;x++){const d=r[x].getElementsByTagName('td');let s=false;for(let j=0;j<d.length;j++){if(d[j].textContent.toUpperCase().indexOf(v)>-1){s=true;break;}}r[x].style.display=s?'':'none';}}</script>
 </head><body>
-<div class='header'><h1>Group Policy Preferences Report</h1><p>GPO Backup Folder: $GPOBackupRoot</p><p>Report Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p><p><a href='https://github.com/alexverboon/GroupPolicypreferencesReporter' target='_blank'>📁 View on GitHub</a></p></div>
+<a href='https://github.com/alexverboon/GroupPolicypreferencesReporter' target='_blank' class='github-corner' aria-label='View source on GitHub'><svg viewBox='0 0 250 250' aria-hidden='true'><path d='M0,0 L115,115 L130,115 L142,142 L250,250 L250,0 Z'></path><path d='M128.3,109.0 C113.8,99.7 119.0,89.6 119.0,89.6 C122.0,82.7 120.5,78.6 120.5,78.6 C119.2,72.0 123.4,76.3 123.4,76.3 C127.3,80.9 125.5,87.3 125.5,87.3 C122.9,97.6 130.6,101.9 134.4,103.2' fill='currentColor' style='transform-origin:130px 106px;' class='octo-arm'></path><path d='M115.0,115.0 C114.9,115.1 118.7,116.5 119.8,115.4 L133.7,101.6 C136.9,99.2 139.9,98.4 142.2,98.6 C133.8,88.0 127.5,74.4 143.8,58.0 C148.5,53.4 154.0,51.2 159.7,51.0 C160.3,49.4 163.2,43.6 171.4,40.1 C171.4,40.1 176.1,42.5 178.8,56.2 C183.1,58.6 187.2,61.8 190.9,65.4 C194.5,69.0 197.7,73.2 200.1,77.6 C213.8,80.2 216.3,84.9 216.3,84.9 C212.7,93.1 206.9,96.0 205.4,96.6 C205.1,102.4 203.0,107.8 198.3,112.5 C181.9,128.9 168.3,122.5 157.7,114.1 C157.9,116.9 156.7,120.9 152.7,124.9 L141.0,136.5 C139.8,137.7 141.6,141.9 141.8,141.8 Z' fill='currentColor' class='octo-body'></path></svg></a>
+<div class='header'><h1>Group Policy Preferences Report</h1><p>GPO Backup Folder: $GPOBackupRoot</p><p>Report Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p></div>
 <div class='container'>
 <div class='main-section'>
 <h1>Overview</h1>
@@ -923,6 +1027,7 @@ $html = @"
 <div class='card'><h3>Total GPOs</h3><div class='value'>$uniqueGPOs</div></div>
 <div class='card'><h3>GPOs with Preferences</h3><div class='value'>$gposWithPrefs</div></div>
 <div class='card'><h3>Total Preference Records</h3><div class='value'>$totalRecords</div></div>
+<div class='card'><h3>Risky Configurations</h3><div class='value'>$riskyConfigs</div></div>
 </div>
 </div>
 
@@ -970,25 +1075,65 @@ $html += @"
 <h1>Details</h1>
 "@
 
-$html += Build-Section 'Drive Mappings' 'drives' $results.Drives @('Domain','GPO','Config','DriveLetter','Path','Label','UserName','Persistent','UseLetter','Action') 'driveFilter' 'driveTable'
-$html += Build-Section 'Registry Settings' 'registry' $results.Registry @('Domain','GPO','Config','Hive','RegistryKey','ValueName','ValueData','ValueType','Action','DisplayDecimal') 'regFilter' 'regTable'
-$html += Build-Section 'Printers' 'printers' $results.Printers @('Domain','GPO','Config','PrinterName','Path','Comment','Location','Port','Action') 'printerFilter' 'printerTable'
+$html += Build-Section 'Drive Mappings' 'drives' $results.Drives @('Domain','GPO','Config','DriveLetter','Path','Label','UserName','Action','SecurityFinding') 'driveFilter' 'driveTable'
+$html += Build-Section 'Registry Settings' 'registry' $results.Registry @('Domain','GPO','Config','Hive','RegistryKey','ValueName','ValueData','ValueType','Action','DisplayDecimal','SecurityFinding') 'regFilter' 'regTable'
+$html += Build-Section 'Printers' 'printers' $results.Printers @('Domain','GPO','Config','PrinterName','Path','Comment','Location','Port','Action','SecurityFinding') 'printerFilter' 'printerTable'
 $html += Build-Section 'Shortcuts' 'shortcuts' $results.Shortcuts @('Domain','GPO','Config','ShortcutName','TargetPath','ShortcutPath','Arguments','Comment','TargetType','Action') 'shortcutFilter' 'shortcutTable'
-$html += Build-Section 'Local Groups' 'groups' $results.Groups @('Domain','GPO','Config','GroupName','GroupAction','MemberName','MemberAction','MemberSID','Description') 'groupsFilter' 'groupsTable'
-$html += Build-Section 'Local Users' 'users' $results.Users @('Domain','GPO','Config','UserName','FullName','Description','Action','NeverExpires','AccountDisabled','ChangeLogon','NoChange','Changed') 'usersFilter' 'usersTable'
+$html += Build-Section 'Local Groups' 'groups' $results.Groups @('Domain','GPO','Config','GroupName','GroupAction','MemberName','MemberAction','MemberSID','Description','SecurityFinding') 'groupsFilter' 'groupsTable'
+$html += Build-Section 'Local Users' 'users' $results.Users @('Domain','GPO','Config','UserName','FullName','Description','Action','NeverExpires','AccountDisabled','SecurityFinding') 'usersFilter' 'usersTable'
 $html += Build-Section 'Files' 'files' $results.Files @('Domain','GPO','Config','FileName','SourcePath','TargetPath','Action','ReadOnly','Archive','Hidden','Suppress','Changed') 'filesFilter' 'filesTable'
 $html += Build-Section 'Folders' 'folders' $results.Folders @('Domain','GPO','Config','FolderName','FolderPath','Action','DeleteFolder','DeleteSubFolders','DeleteFiles','DeleteReadOnly','Archive','Hidden','Changed') 'foldersFilter' 'foldersTable'
+$html += Build-Section 'Folders ACL' 'foldersacl' $results.FoldersACL @('Domain','GPO','Config','FolderName','FolderPath','Principal','ACEType','Rights','Inheritance','FolderAction','SecurityFinding') 'folderaclFilter' 'folderaclTable'
 $html += Build-Section 'INI Files' 'inifiles' $results.IniFiles @('Domain','GPO','Config','IniName','IniPath','Section','Property','Value','Action','Changed') 'inifilesFilter' 'inifilesTable'
 $html += Build-Section 'Network Shares' 'networkshares' $results.NetworkShares @('Domain','GPO','Config','ShareName','SharePath','Comment','Action','AllRegular','AllHidden','AllAdminDrive','LimitUsers','ABE','Changed') 'networksharesFilter' 'networksharesTable'
-$html += Build-Section 'Data Sources' 'datasources' $results.DataSources @('Domain','GPO','Config','DataSourceName','DSN','Driver','Description','UserName','Action','UserDSN','UserContext','Changed') 'datasourcesFilter' 'datasourcesTable'
+$html += Build-Section 'Data Sources' 'datasources' $results.DataSources @('Domain','GPO','Config','DataSourceName','DSN','Driver','Description','UserName','Action','SecurityFinding') 'datasourcesFilter' 'datasourcesTable'
 $html += Build-Section 'Devices' 'devices' $results.Devices @('Domain','GPO','Config','DeviceName','DeviceAction','DeviceClass','DeviceType','DeviceClassGUID','DeviceTypeID','UserContext','RemovePolicy','Changed') 'devicesFilter' 'devicesTable'
 $html += Build-Section 'Environment Variables' 'env' $results.EnvironmentVariables @('Domain','GPO','Config','VariableName','VariableValue','Action','User','Partial','RemovePolicy','BypassErrors','Changed') 'envFilter' 'envTable'
 $html += Build-Section 'Internet Settings' 'inet' $results.InternetSettings @('Domain','GPO','Config','IEVersion','SettingId','SettingName','RegistryKey','ValueType','Value','Disabled') 'inetFilter' 'inetTable'
-$html += Build-Section 'Scheduled Tasks' 'tasks' $results.ScheduledTasks @('Domain','GPO','Config','TaskName','Action','Author','Description','RunAs','Enabled','TriggerType','Command','Arguments','Changed') 'tasksFilter' 'tasksTable'
+$html += Build-Section 'Scheduled Tasks' 'tasks' $results.ScheduledTasks @('Domain','GPO','Config','TaskName','Action','Author','Description','RunAs','Enabled','TriggerType','Command','SecurityFinding') 'tasksFilter' 'tasksTable'
 $html += Build-Section 'Power Options' 'power' $results.PowerOptions @('Domain','GPO','Config','PowerPlanName','DefaultPlan','SleepAfterAC','SleepAfterDC','HibernateAC','HibernateDC','DisplayOffAC','DisplayOffDC','LidCloseAC','LidCloseDC','ProcStateMinAC','ProcStateMinDC','Changed') 'powerFilter' 'powerTable'
 $html += Build-Section 'Folder Options' 'folderopts' $results.FolderOptions @('Domain','GPO','Config','OpenWithName','FileExtension','ApplicationPath','Action','Default','UserContext','RemovePolicy','Changed') 'folderoptFilter' 'folderoptTable'
-$html += Build-Section 'Services' 'services' $results.Services @('Domain','GPO','Config','ServiceName','DisplayName','StartupType','Timeout','Action','Changed') 'servicesFilter' 'servicesTable'
+$html += Build-Section 'Services' 'services' $results.Services @('Domain','GPO','Config','ServiceName','DisplayName','StartupType','Timeout','Action','SecurityFinding') 'servicesFilter' 'servicesTable'
 $html += Build-Section 'Other Types' 'other' $results.OtherTypes @('Domain','GPO','Config','PreferenceType','XmlPath','Note') 'otherFilter' 'otherTable'
+
+# Aggregate all risky configurations
+$riskyConfigsList = @()
+@($results.Drives, $results.Registry, $results.Printers, $results.Groups, $results.GroupsDetail, $results.Users, $results.DataSources, $results.FoldersACL, $results.ScheduledTasks, $results.Services) | ForEach-Object {
+    $riskyConfigsList += @($_ | Where-Object { $_.SecurityFinding -and $_.SecurityFinding -ne '' } | ForEach-Object {
+        $type = ''
+        if ($_ -in $results.Drives) { $type = 'Drive Mapping' }
+        elseif ($_ -in $results.Registry) { $type = 'Registry' }
+        elseif ($_ -in $results.Printers) { $type = 'Printer' }
+        elseif ($_ -in $results.Groups) { $type = 'Group Member' }
+        elseif ($_ -in $results.GroupsDetail) { $type = 'Group' }
+        elseif ($_ -in $results.Users) { $type = 'User' }
+        elseif ($_ -in $results.DataSources) { $type = 'DataSource' }
+        elseif ($_ -in $results.FoldersACL) { $type = 'Folder ACL' }
+        elseif ($_ -in $results.ScheduledTasks) { $type = 'Scheduled Task' }
+        elseif ($_ -in $results.Services) { $type = 'Service' }
+        
+        $itemName = ''
+        if ($_.DriveLetter) { $itemName = $_.DriveLetter }
+        elseif ($_.RegistryKey) { $itemName = "$($_.RegistryKey)\$($_.ValueName)" }
+        elseif ($_.PrinterName) { $itemName = $_.PrinterName }
+        elseif ($_.GroupName) { $itemName = if ($_.MemberName) { "$($_.GroupName) / $($_.MemberName)" } else { $_.GroupName } }
+        elseif ($_.UserName) { $itemName = $_.UserName }
+        elseif ($_.DataSourceName) { $itemName = $_.DataSourceName }
+        elseif ($_.FolderName) { $itemName = "$($_.FolderName) / $($_.Principal)" }
+        elseif ($_.TaskName) { $itemName = $_.TaskName }
+        elseif ($_.ServiceName) { $itemName = $_.ServiceName }
+        
+        [pscustomobject]@{
+            Domain = $_.Domain
+            GPO = $_.GPO
+            Type = $type
+            Item = $itemName
+            SecurityFinding = $_.SecurityFinding
+        }
+    })
+}
+
+$html += Build-Section 'Risky Configurations' 'risky' $riskyConfigsList @('Domain','GPO','Type','Item','SecurityFinding') 'riskyFilter' 'riskyTable'
 
 $html += @"
 </div>

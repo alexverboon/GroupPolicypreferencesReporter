@@ -28,6 +28,11 @@
     If specified, CSV files will be generated alongside the HTML report.
     Default: $false (CSV export disabled)
 
+.PARAMETER ExportJSON
+    Switch parameter to enable JSON export of all collected data.
+    If specified, a JSON file will be generated with all preference data.
+    Default: $false (JSON export disabled)
+
 .EXAMPLE
     # Generate HTML report only (default)
     .\Create-GPPReport.ps1
@@ -44,6 +49,14 @@
     # Generate report with CSV exports to custom location
     .\Create-GPPReport.ps1 -GPOBackupRoot "D:\GPOBackup" -OutputDir "C:\Reports" -ExportCSV
 
+.EXAMPLE
+    # Generate report with JSON export
+    .\Create-GPPReport.ps1 -ExportJSON
+
+.EXAMPLE
+    # Generate report with both CSV and JSON exports
+    .\Create-GPPReport.ps1 -ExportCSV -ExportJSON
+
 .NOTES
     Author:         Alex Verboon
     Created:        2026-01-17
@@ -58,6 +71,7 @@
     Output Files:
     - HTML Report: Group Policy Preferences Report_YYYYMMDD_HHMMSS.html
     - CSV Files (if -ExportCSV): Multiple CSV files for each preference type
+    - JSON File (if -ExportJSON): GPP_Complete_Data_YYYYMMDD_HHMMSS.json
     
     License:        MIT
     Repository:     https://github.com/averboon/GroupPolicypreferencesReporter
@@ -70,7 +84,8 @@
 param(
     [string]$GPOBackupRoot = "C:\\Temp\\GPOBackup",
     [string]$OutputDir = "c:\\Temp\\GPOBackup\\GPP-Report",
-    [switch]$ExportCSV = $false
+    [switch]$ExportCSV = $false,
+    [switch]$ExportJSON = $false
 )
 
 if (-not (Test-Path $GPOBackupRoot)) { throw "Backup root not found: $GPOBackupRoot" }
@@ -691,79 +706,7 @@ if ($ExportCSV) {
     Write-Host "Skipping CSV export (disabled)" -ForegroundColor Yellow
 }
 
-Write-Host "Generating HTML report..." -ForegroundColor Cyan
-
-$summary = @(
-    @{Name='Drive Mappings'; Data=$results.Drives},
-    @{Name='Registry Settings'; Data=$results.Registry},
-    @{Name='Printers'; Data=$results.Printers},
-    @{Name='Shortcuts'; Data=$results.Shortcuts},
-    @{Name='Local Groups'; Data=$results.GroupsDetail},
-    @{Name='Group Memberships'; Data=$results.Groups},
-    @{Name='Local Users'; Data=$results.Users},
-    @{Name='Files'; Data=$results.Files},
-    @{Name='Folders'; Data=$results.Folders},
-    @{Name='INI Files'; Data=$results.IniFiles},
-    @{Name='Network Shares'; Data=$results.NetworkShares},
-    @{Name='Data Sources'; Data=$results.DataSources},
-    @{Name='Devices'; Data=$results.Devices},
-    @{Name='Environment Variables'; Data=$results.EnvironmentVariables},
-    @{Name='Internet Settings'; Data=$results.InternetSettings},
-    @{Name='Power Options'; Data=$results.PowerOptions},
-    @{Name='Folder Options'; Data=$results.FolderOptions},
-    @{Name='Services'; Data=$results.Services},
-    @{Name='Scheduled Tasks'; Data=$results.ScheduledTasks},
-    @{Name='Other Types'; Data=$results.OtherTypes}
-)
-
-# sum total rows across all GPP types
-$totalRecords = (($summary | ForEach-Object { $_.Data.Count }) | Measure-Object -Sum).Sum
-
-function Build-Section($title,$id,$data,$columns,$filterId,$tableId) {
-    if (-not $data -or $data.Count -eq 0) { return '' }
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.Append("<details><summary>$title <span style='color:#106ebe;font-size:14px;'>($($data.Count))</span></summary>")
-    [void]$sb.Append("<div class='section' id='$id'>")
-    if ($filterId -and $tableId) {
-        [void]$sb.Append("<div class='filter'><input id='$filterId' onkeyup=`"filterTable('$filterId','$tableId')`" placeholder='Filter...'></div>")
-    }
-    [void]$sb.Append("<table id='$tableId'><tr>")
-    foreach ($c in $columns) { [void]$sb.Append("<th>$c</th>") }
-    [void]$sb.Append("</tr>")
-    foreach ($row in ($data | Select-Object -First 500)) {
-        [void]$sb.Append("<tr>")
-        foreach ($c in $columns) {
-            $val = EncodeHtml $row.$c
-            [void]$sb.Append("<td>$val</td>")
-        }
-        [void]$sb.Append("</tr>")
-    }
-    [void]$sb.Append("</table></div></details>")
-    return $sb.ToString()
-}
-
-function Build-SubSection($title,$data,$columns,$filterId,$tableId) {
-    if (-not $data -or $data.Count -eq 0) { return '' }
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.Append("<h3 style='margin-top:20px;color:#0078d4;'>$title <span style='color:#106ebe;font-size:13px;'>($($data.Count))</span></h3>")
-    if ($filterId -and $tableId) {
-        [void]$sb.Append("<div class='filter'><input id='$filterId' onkeyup=`"filterTable('$filterId','$tableId')`" placeholder='Filter...'></div>")
-    }
-    [void]$sb.Append("<table id='$tableId'><tr>")
-    foreach ($c in $columns) { [void]$sb.Append("<th>$c</th>") }
-    [void]$sb.Append("</tr>")
-    foreach ($row in ($data | Select-Object -First 500)) {
-        [void]$sb.Append("<tr>")
-        foreach ($c in $columns) {
-            $val = EncodeHtml $row.$c
-            [void]$sb.Append("<td>$val</td>")
-        }
-        [void]$sb.Append("</tr>")
-    }
-    [void]$sb.Append("</table>")
-    return $sb.ToString()
-}
-# Calculate overview statistics
+# Calculate overview statistics and preference type distribution for both JSON and HTML
 $allRecords = @()
 $results.Keys | ForEach-Object {
     if ($results[$_] -is [System.Collections.Generic.List[Object]]) {
@@ -771,7 +714,7 @@ $results.Keys | ForEach-Object {
     }
 }
 
-# Count all GPOs from gpreport.xml files (including those without preferences)
+# Count all GPOs from gpreport.xml files
 $allGpos = @()
 $gpoReportFiles = Get-ChildItem -Path $GPOBackupRoot -Recurse -Filter "gpreport.xml" -ErrorAction SilentlyContinue
 foreach ($reportFile in $gpoReportFiles) {
@@ -845,15 +788,133 @@ foreach ($pref in ($prefTypeMap | Where-Object { $allowedPrefCategories -contain
     }
 }
 
+$summary = @(
+    @{Name='Drive Mappings'; Data=$results.Drives},
+    @{Name='Registry Settings'; Data=$results.Registry},
+    @{Name='Printers'; Data=$results.Printers},
+    @{Name='Shortcuts'; Data=$results.Shortcuts},
+    @{Name='Local Groups'; Data=$results.GroupsDetail},
+    @{Name='Group Memberships'; Data=$results.Groups},
+    @{Name='Local Users'; Data=$results.Users},
+    @{Name='Files'; Data=$results.Files},
+    @{Name='Folders'; Data=$results.Folders},
+    @{Name='INI Files'; Data=$results.IniFiles},
+    @{Name='Network Shares'; Data=$results.NetworkShares},
+    @{Name='Data Sources'; Data=$results.DataSources},
+    @{Name='Devices'; Data=$results.Devices},
+    @{Name='Environment Variables'; Data=$results.EnvironmentVariables},
+    @{Name='Internet Settings'; Data=$results.InternetSettings},
+    @{Name='Power Options'; Data=$results.PowerOptions},
+    @{Name='Folder Options'; Data=$results.FolderOptions},
+    @{Name='Services'; Data=$results.Services},
+    @{Name='Scheduled Tasks'; Data=$results.ScheduledTasks},
+    @{Name='Other Types'; Data=$results.OtherTypes}
+)
+
+$totalRecords = (($summary | ForEach-Object { $_.Data.Count }) | Measure-Object -Sum).Sum
+
+if ($ExportJSON) {
+    Write-Host "" -ForegroundColor Cyan
+    Write-Host "Exporting JSON data..." -ForegroundColor Cyan
+    $jsonFileName = "GPP_Complete_Data_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+    $jsonPath = Join-Path $OutputDir $jsonFileName
+    
+    # Build comprehensive JSON structure with metadata, overview, distribution, and raw data
+    $jsonData = [ordered]@{
+        ReportMetadata = [ordered]@{
+            ReportGeneratedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            GPOBackupFolder = $GPOBackupRoot
+            OutputDirectory = $OutputDir
+        }
+        Overview = [ordered]@{
+            TotalDomains = $uniqueDomains
+            TotalGPOs = $uniqueGPOs
+            GPOsWithPreferences = $gposWithPrefs
+            TotalPreferenceRecords = $totalRecords
+        }
+        PreferenceTypeDistribution = @{
+            WindowsSettings = @($prefTypeStats | Where-Object { $_.Category -eq 'Windows' } | ForEach-Object {
+                [ordered]@{
+                    Type = $_.Type
+                    Name = $_.Name
+                    GPOCount = $_.GPOCount
+                    RecordCount = $_.RecordCount
+                }
+            })
+            ControlPanelSettings = @($prefTypeStats | Where-Object { $_.Category -eq 'ControlPanel' } | ForEach-Object {
+                [ordered]@{
+                    Type = $_.Type
+                    Name = $_.Name
+                    GPOCount = $_.GPOCount
+                    RecordCount = $_.RecordCount
+                }
+            })
+        }
+        PreferenceData = $results
+    }
+    
+    $jsonData | ConvertTo-Json -Depth 10 | Out-File $jsonPath -Encoding UTF8
+    Write-Host "JSON export completed: $jsonPath" -ForegroundColor Green
+} else {
+    Write-Host "Skipping JSON export (disabled)" -ForegroundColor Yellow
+}
+
+Write-Host "Generating HTML report..." -ForegroundColor Cyan
+
+function Build-Section($title,$id,$data,$columns,$filterId,$tableId) {
+    if (-not $data -or $data.Count -eq 0) { return '' }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append("<details><summary>$title <span style='color:#106ebe;font-size:14px;'>($($data.Count))</span></summary>")
+    [void]$sb.Append("<div class='section' id='$id'>")
+    if ($filterId -and $tableId) {
+        [void]$sb.Append("<div class='filter'><input id='$filterId' onkeyup=`"filterTable('$filterId','$tableId')`" placeholder='Filter...'></div>")
+    }
+    [void]$sb.Append("<table id='$tableId'><tr>")
+    foreach ($c in $columns) { [void]$sb.Append("<th>$c</th>") }
+    [void]$sb.Append("</tr>")
+    foreach ($row in ($data | Select-Object -First 500)) {
+        [void]$sb.Append("<tr>")
+        foreach ($c in $columns) {
+            $val = EncodeHtml $row.$c
+            [void]$sb.Append("<td>$val</td>")
+        }
+        [void]$sb.Append("</tr>")
+    }
+    [void]$sb.Append("</table></div></details>")
+    return $sb.ToString()
+}
+
+function Build-SubSection($title,$data,$columns,$filterId,$tableId) {
+    if (-not $data -or $data.Count -eq 0) { return '' }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append("<h3 style='margin-top:20px;color:#0078d4;'>$title <span style='color:#106ebe;font-size:13px;'>($($data.Count))</span></h3>")
+    if ($filterId -and $tableId) {
+        [void]$sb.Append("<div class='filter'><input id='$filterId' onkeyup=`"filterTable('$filterId','$tableId')`" placeholder='Filter...'></div>")
+    }
+    [void]$sb.Append("<table id='$tableId'><tr>")
+    foreach ($c in $columns) { [void]$sb.Append("<th>$c</th>") }
+    [void]$sb.Append("</tr>")
+    foreach ($row in ($data | Select-Object -First 500)) {
+        [void]$sb.Append("<tr>")
+        foreach ($c in $columns) {
+            $val = EncodeHtml $row.$c
+            [void]$sb.Append("<td>$val</td>")
+        }
+        [void]$sb.Append("</tr>")
+    }
+    [void]$sb.Append("</table>")
+    return $sb.ToString()
+}
+
 $report = Join-Path $OutputDir "Group Policy Preferences Report_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
 
 $html = @"
 <!DOCTYPE html>
 <html><head><meta charset='UTF-8'><title>Group Policy Preferences Report</title>
-<style>body{font-family:Segoe UI,Arial,sans-serif;background:#f5f5f5;margin:0;} .header{background:linear-gradient(135deg,#0078d4,#106ebe);color:#fff;padding:26px;text-align:center;} .container{max-width:1650px;margin:0 auto;padding:18px;display:flex;flex-direction:column;gap:24px;} .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin:18px 0;} .card{background:#fff;padding:18px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,.12);} .card h3{margin:0;color:#0078d4;} .value{font-size:30px;font-weight:700;color:#0078d4;} .pref-section{display:flex;gap:24px;margin:18px 0;} .pref-section-col{flex:1;} .pref-section-col h3{margin:0 0 12px 0;color:#0078d4;font-size:16px;font-weight:600;} .pref-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;} .pref-card{background:#fff;padding:14px;border-radius:6px;border-left:4px solid #0078d4;box-shadow:0 1px 3px rgba(0,0,0,.1);} .pref-card h4{margin:0 0 8px 0;color:#0078d4;font-size:13px;text-transform:uppercase;} .pref-card .pref-value{font-size:20px;font-weight:700;color:#106ebe;display:flex;align-items:baseline;gap:6px;} .pref-card .pref-sub{font-size:11px;font-weight:600;color:#666;} table{width:100%;border-collapse:collapse;margin:12px 0;font-size:13px;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.1);table-layout:auto;} th{background:#0078d4;color:#fff;padding:9px 7px;text-align:left;position:sticky;top:0;word-break:break-word;white-space:nowrap;overflow-wrap:anywhere;} td{padding:8px 7px;border-bottom:1px solid #e5e5e5;word-break:break-word;overflow-wrap:anywhere;} tr:nth-child(even){background:#f8f9fa;} tr:hover{background:#e9f3ff;} #driveTable td:nth-child(5),#driveTable td:nth-child(6){max-width:200px;} #regTable td:nth-child(7){max-width:350px;} #printerTable td:nth-child(5){max-width:200px;} #shortcutTable td:nth-child(5),#shortcutTable td:nth-child(6){max-width:200px;} #filesTable td:nth-child(5),#filesTable td:nth-child(6){max-width:200px;} #foldersTable td:nth-child(4),#foldersTable td:nth-child(5){max-width:200px;} #inifilesTable td:nth-child(4),#inifilesTable td:nth-child(5){max-width:200px;} #networksharesTable td:nth-child(4),#networksharesTable td:nth-child(5){max-width:200px;} #datasourcesTable td:nth-child(5),#datasourcesTable td:nth-child(6){max-width:200px;} #devicesTable td:nth-child(4){max-width:200px;} #inetTable td:nth-child(6){max-width:250px;} #tasksTable td:nth-child(5),#tasksTable td:nth-child(12){max-width:200px;} #powerTable td:nth-child(4){max-width:200px;} #folderoptTable td:nth-child(4){max-width:200px;} details{margin:20px 0;background:#fff;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,.1);} details[open]{box-shadow:0 2px 8px rgba(0,0,0,.15);} summary{cursor:pointer;padding:16px;background:#f8f9fa;border-radius:6px;font-weight:600;color:#0078d4;user-select:none;display:flex;justify-content:space-between;align-items:center;} summary:hover{background:#e9f3ff;} details[open]>summary{background:#0078d4;color:#fff;border-radius:6px 6px 0 0;} .section{display:block;padding:0;width:100%;} .filter input{padding:7px 9px;width:280px;border:1px solid #ccc;border-radius:4px;} .filter{padding:12px 16px;border-top:1px solid #e5e5e5;} .main-section{background:#fff;padding:24px;border-radius:8px;margin-bottom:30px;box-shadow:0 2px 8px rgba(0,0,0,.1);} .main-section h1{color:#0078d4;margin:0 0 20px 0;padding-bottom:12px;border-bottom:3px solid #0078d4;font-size:24px;}</style>
+<style>body{font-family:Segoe UI,Arial,sans-serif;background:#f5f5f5;margin:0;} .header{background:linear-gradient(135deg,#0078d4,#106ebe);color:#fff;padding:26px;text-align:center;} .header a{color:#fff;text-decoration:none;border:1px solid rgba(255,255,255,.4);padding:6px 14px;border-radius:4px;display:inline-block;margin-top:8px;font-size:13px;transition:all .2s;} .header a:hover{background:rgba(255,255,255,.15);border-color:#fff;} .container{max-width:1650px;margin:0 auto;padding:18px;display:flex;flex-direction:column;gap:24px;} .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin:18px 0;} .card{background:#fff;padding:18px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,.12);} .card h3{margin:0;color:#0078d4;} .value{font-size:30px;font-weight:700;color:#0078d4;} .pref-section{display:flex;gap:24px;margin:18px 0;} .pref-section-col{flex:1;} .pref-section-col h3{margin:0 0 12px 0;color:#0078d4;font-size:16px;font-weight:600;} .pref-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;} .pref-card{background:#fff;padding:14px;border-radius:6px;border-left:4px solid #0078d4;box-shadow:0 1px 3px rgba(0,0,0,.1);} .pref-card h4{margin:0 0 8px 0;color:#0078d4;font-size:13px;text-transform:uppercase;} .pref-card .pref-value{font-size:20px;font-weight:700;color:#106ebe;display:flex;align-items:baseline;gap:6px;} .pref-card .pref-sub{font-size:11px;font-weight:600;color:#666;} table{width:100%;border-collapse:collapse;margin:12px 0;font-size:13px;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.1);table-layout:auto;} th{background:#0078d4;color:#fff;padding:9px 7px;text-align:left;position:sticky;top:0;word-break:break-word;white-space:nowrap;overflow-wrap:anywhere;} td{padding:8px 7px;border-bottom:1px solid #e5e5e5;word-break:break-word;overflow-wrap:anywhere;} tr:nth-child(even){background:#f8f9fa;} tr:hover{background:#e9f3ff;} #driveTable td:nth-child(5),#driveTable td:nth-child(6){max-width:200px;} #regTable td:nth-child(7){max-width:350px;} #printerTable td:nth-child(5){max-width:200px;} #shortcutTable td:nth-child(5),#shortcutTable td:nth-child(6){max-width:200px;} #filesTable td:nth-child(5),#filesTable td:nth-child(6){max-width:200px;} #foldersTable td:nth-child(4),#foldersTable td:nth-child(5){max-width:200px;} #inifilesTable td:nth-child(4),#inifilesTable td:nth-child(5){max-width:200px;} #networksharesTable td:nth-child(4),#networksharesTable td:nth-child(5){max-width:200px;} #datasourcesTable td:nth-child(5),#datasourcesTable td:nth-child(6){max-width:200px;} #devicesTable td:nth-child(4){max-width:200px;} #inetTable td:nth-child(6){max-width:250px;} #tasksTable td:nth-child(5),#tasksTable td:nth-child(12){max-width:200px;} #powerTable td:nth-child(4){max-width:200px;} #folderoptTable td:nth-child(4){max-width:200px;} details{margin:20px 0;background:#fff;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,.1);} details[open]{box-shadow:0 2px 8px rgba(0,0,0,.15);} summary{cursor:pointer;padding:16px;background:#f8f9fa;border-radius:6px;font-weight:600;color:#0078d4;user-select:none;display:flex;justify-content:space-between;align-items:center;} summary:hover{background:#e9f3ff;} details[open]>summary{background:#0078d4;color:#fff;border-radius:6px 6px 0 0;} .section{display:block;padding:0;width:100%;} .filter input{padding:7px 9px;width:280px;border:1px solid #ccc;border-radius:4px;} .filter{padding:12px 16px;border-top:1px solid #e5e5e5;} .main-section{background:#fff;padding:24px;border-radius:8px;margin-bottom:30px;box-shadow:0 2px 8px rgba(0,0,0,.1);} .main-section h1{color:#0078d4;margin:0 0 20px 0;padding-bottom:12px;border-bottom:3px solid #0078d4;font-size:24px;}</style>
 <script>function filterTable(i,t){const v=document.getElementById(i).value.toUpperCase();const r=document.getElementById(t).getElementsByTagName('tr');for(let x=1;x<r.length;x++){const d=r[x].getElementsByTagName('td');let s=false;for(let j=0;j<d.length;j++){if(d[j].textContent.toUpperCase().indexOf(v)>-1){s=true;break;}}r[x].style.display=s?'':'none';}}</script>
 </head><body>
-<div class='header'><h1>Group Policy Preferences Report</h1><p>GPO Backup Folder: $GPOBackupRoot</p><p>Report Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p></div>
+<div class='header'><h1>Group Policy Preferences Report</h1><p>GPO Backup Folder: $GPOBackupRoot</p><p>Report Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p><p><a href='https://github.com/alexverboon/GroupPolicypreferencesReporter' target='_blank'>📁 View on GitHub</a></p></div>
 <div class='container'>
 <div class='main-section'>
 <h1>Overview</h1>

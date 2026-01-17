@@ -92,7 +92,18 @@ Contributions, issues, and feature requests are welcome!
 
 - [MS14-025: Vulnerability in Group Policy Preferences could allow elevation of privilege: May 13, 2014](https://support.microsoft.com/en-us/topic/ms14-025-vulnerability-in-group-policy-preferences-could-allow-elevation-of-privilege-may-13-2014-60734e15-af79-26ca-ea53-8cd617073c30)
 
+- [Unsecured Credentials: Group Policy Preferences](https://attack.mitre.org/techniques/T1552/006/)
+
 ## Changelog
+
+### Version 1.1 (2026-01-17)
+
+- Merged DefaultPassword and DefaultUserName registry checks into single Risky Configuration entry
+- Renamed ODBC findings to "Data Source stored credentials"
+- Removed AutoAdminLogon check from security findings
+- Enhanced Risky Configurations display with conditional "Has cpassword" column
+- Excluded ACL and admin group findings from cpassword column display
+- Improved DefaultPassword validation to detect plaintext credentials
 
 ### Version 1.0 (2026-01-17)
 

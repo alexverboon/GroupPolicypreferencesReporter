@@ -61,7 +61,7 @@
     Author:         Alex Verboon
     Created:        2026-01-17
     Last Modified:  2026-01-17
-    Version:        1.0
+    Version:        1.1
     
     Requirements:
     - PowerShell 5.1 or higher
@@ -82,14 +82,49 @@
 #>
 
 param(
-    [string]$GPOBackupRoot = "C:\\Temp\\GPOBackup",
+    [Parameter(Mandatory=$false, HelpMessage="Root directory containing GPO backup files")]
+    [ValidateScript({Test-Path $_ -PathType Container})]
+    [string]$GPOBackupRoot = "C:\\Temp\\GPOBackup\\GPoBackup2",
+    
+    [Parameter(Mandatory=$false, HelpMessage="Output directory for reports")]
     [string]$OutputDir = "c:\\Temp\\GPOBackup\\GPP-Report",
+    
+    [Parameter(Mandatory=$false, HelpMessage="Export CSV files for each preference type")]
     [switch]$ExportCSV = $false,
+    
+    [Parameter(Mandatory=$false, HelpMessage="Export JSON file with all data")]
     [switch]$ExportJSON = $false
 )
 
-if (-not (Test-Path $GPOBackupRoot)) { throw "Backup root not found: $GPOBackupRoot" }
-if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir | Out-Null }
+#region Initialization
+$ErrorActionPreference = 'Stop'
+$script:ErrorCount = 0
+$script:WarningCount = 0
+
+Write-Host "Initializing GPP Report Generator..." -ForegroundColor Cyan
+
+try {
+    # Validate GPO backup root
+    if (-not (Test-Path $GPOBackupRoot)) {
+        throw "Backup root not found: $GPOBackupRoot"
+    }
+    
+    # Create output directory if it doesn't exist
+    if (-not (Test-Path $OutputDir)) {
+        Write-Host "Creating output directory: $OutputDir" -ForegroundColor Yellow
+        New-Item -ItemType Directory -Path $OutputDir -ErrorAction Stop | Out-Null
+    }
+    
+    Write-Host "GPO Backup Root: $GPOBackupRoot" -ForegroundColor Green
+    Write-Host "Output Directory: $OutputDir" -ForegroundColor Green
+}
+catch {
+    Write-Error "Initialization failed: $($_.Exception.Message)"
+    exit 1
+}
+#endregion
+
+#region Data Structures and Helper Functions
 
 $results = [ordered]@{
     Drives = New-Object System.Collections.Generic.List[object]
@@ -155,7 +190,7 @@ function Get-GpoMetadata([string]$preferenceFilePath) {
     
     if ($reportFile -and (Test-Path $reportFile)) {
         try {
-            [xml]$xml = Get-Content -Path $reportFile -Raw
+            [xml]$xml = Get-Content -Path $reportFile -Raw -ErrorAction Stop
             
             # Extract Name from DocumentElement's direct Name child
             foreach ($child in $xml.DocumentElement.ChildNodes) {
@@ -178,7 +213,9 @@ function Get-GpoMetadata([string]$preferenceFilePath) {
                 }
             }
         } catch {
-            # If gpreport.xml fails to parse, default to UnknownDomain/UnknownGPO
+            $script:WarningCount++
+            Write-Verbose "Failed to parse gpreport.xml at $reportFile : $($_.Exception.Message)"
+            # Continue with UnknownDomain/UnknownGPO defaults
         }
     }
     
@@ -203,6 +240,106 @@ function EncodeHtml([string]$s) {
     return $s -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;'
 }
 
+# Security check helpers (centralized for clarity)
+function Test-CpasswordPresent($node, $props) {
+    # Check cpassword attribute on node or its Properties element
+    if ($node -and $node.PSObject.Properties['cpassword']) {
+        $val = $node.PSObject.Properties['cpassword'].Value
+        if (-not [string]::IsNullOrEmpty($val)) { return $true }
+    }
+    if ($props -and $props.PSObject.Properties['cpassword']) {
+        $val = $props.PSObject.Properties['cpassword'].Value
+        if (-not [string]::IsNullOrEmpty($val)) { return $true }
+    }
+    if ($node -and $node.Attributes -and $node.Attributes['cpassword']) {
+        $val = $node.Attributes['cpassword'].Value
+        if (-not [string]::IsNullOrEmpty($val)) { return $true }
+    }
+    if ($props -and $props.Attributes -and $props.Attributes['cpassword']) {
+        $val = $props.Attributes['cpassword'].Value
+        if (-not [string]::IsNullOrEmpty($val)) { return $true }
+    }
+    return $false
+}
+
+function Get-DriveSecurityFinding($driveNode, $props) {
+    if (Test-CpasswordPresent $driveNode $props) {
+        return 'Drive mapping with stored credentials - Password in SYSVOL (AES-encrypted)'
+    }
+    return ''
+}
+
+function Get-RegistrySecurityFinding($props) {
+    if (-not $props) { return '' }
+    $regKey = ($props.key | ForEach-Object { $_.ToLower() })
+    $regName = ($props.name | ForEach-Object { $_.ToLower() })
+    # DefaultPassword and DefaultUserName are merged at risky config aggregation level
+    if ($regKey -match 'winlogon' -and ($regName -eq 'defaultpassword' -or $regName -eq 'defaultusername')) {
+        return 'Insecure: Plaintext credentials in registry'
+    }
+    if ($regKey -match 'firewall' -and ($regName -match 'enabled' -or $regName -match 'firewall')) {
+        if ($props.value -eq '0') { return 'Critical: Windows Firewall disabled' }
+    }
+    if ($regKey -match 'uac' -and $regName -match 'enableuac') {
+        if ($props.value -eq '0') { return 'Critical: User Account Control (UAC) disabled' }
+    }
+    return ''
+}
+
+function Get-PrinterSecurityFinding($printerNode, $props) {
+    return ''
+}
+
+function Get-GroupSecurityFinding($props) {
+    if (-not $props) { return '' }
+    if ($props.groupName -eq 'Administrators' -or $props.groupName -match 'Admin') {
+        return 'Local admin group managed via GPP - High privilege modification risk'
+    }
+    return ''
+}
+
+function Get-UserSecurityFinding($userNode, $props) {
+    if (Test-CpasswordPresent $userNode $props) {
+        return 'Local user with stored password in SYSVOL (AES-encrypted) - Credential exposure risk'
+    }
+    return ''
+}
+
+function Get-DataSourceSecurityFinding($dsNode, $props) {
+    if (Test-CpasswordPresent $dsNode $props) {
+        return 'Data Source stored credentials - Password in SYSVOL (AES-encrypted)'
+    }
+    return ''
+}
+
+function Get-FolderAclSecurityFinding($ace) {
+    if (-not $ace) { return '' }
+    $principal = ($ace.principal | ForEach-Object { $_.ToLower() })
+    $rights = ($ace.rights | ForEach-Object { $_.ToLower() })
+    if (($principal -match 'everyone|authenticated users|system' -or $principal -eq 's-1-1-0') -and ($rights -match 'full|modify')) {
+        return "Overly permissive ACL: $($ace.principal) has $($ace.rights) rights"
+    }
+    return ''
+}
+
+function Get-TaskSecurityFinding($taskNode, $props) {
+    if (Test-CpasswordPresent $taskNode $props) {
+        return 'Scheduled task with stored credentials - Password in SYSVOL (AES-encrypted)'
+    }
+    return ''
+}
+
+function Get-ServiceSecurityFinding($serviceNode, $props) {
+    if (Test-CpasswordPresent $serviceNode $props) {
+        return 'Service with stored credentials - Password in SYSVOL (AES-encrypted)'
+    }
+    return ''
+}
+
+#endregion
+
+#region Main Processing
+
 $xmlFiles = Get-ChildItem -Path $GPOBackupRoot -Recurse -Filter *.xml | Where-Object { $_.FullName -match "Preferences" }
 $totalFiles = $xmlFiles.Count
 $fileIndex = 0
@@ -214,10 +351,11 @@ foreach ($file in $xmlFiles) {
     $fileName = Split-Path -Leaf $file.FullName
     Show-ProgressBar $fileIndex $totalFiles "Processing:"
     
-    $config = if ($file.FullName -match "\\User\\") { "User" } elseif ($file.FullName -match "\\Machine\\") { "Machine" } else { "Unknown" }
-    $metadata = Get-GpoMetadata $file.FullName
-    $domain = $metadata.Domain
-    $gpo = $metadata.GPO
+    try {
+        $config = if ($file.FullName -match "\\User\\") { "User" } elseif ($file.FullName -match "\\Machine\\") { "Machine" } else { "Unknown" }
+        $metadata = Get-GpoMetadata $file.FullName
+        $domain = $metadata.Domain
+        $gpo = $metadata.GPO
     $type = switch -Regex ($file.Name) {
         '^Drives.xml$' { 'Drives' }
         '^Registry.xml$' { 'Registry' }
@@ -238,12 +376,14 @@ foreach ($file in $xmlFiles) {
         '^ScheduledTasks.xml$' { 'ScheduledTasks' }
         default { 'OtherTypes' }
     }
-    try {
-        $xml = [xml](Get-Content -Path $file.FullName -Raw)
-    } catch {
-        Add-Item 'OtherTypes' @{ Domain=$domain; GPO=$gpo; Config=$config; PreferenceType=$type; XmlPath=$file.FullName; Note='XML load failed' }
-        continue
-    }
+        try {
+            $xml = [xml](Get-Content -Path $file.FullName -Raw -ErrorAction Stop)
+        } catch {
+            $script:ErrorCount++
+            Write-Warning "Failed to parse XML file: $($file.FullName) - $($_.Exception.Message)"
+            Add-Item 'OtherTypes' @{ Domain=$domain; GPO=$gpo; Config=$config; PreferenceType=$type; XmlPath=$file.FullName; Note="XML load failed: $($_.Exception.Message)" }
+            continue
+        }
 
     switch ($type) {
         'Drives' {
@@ -252,15 +392,13 @@ foreach ($file in $xmlFiles) {
                 if ($null -eq $n) { continue }
                 $props = $n.ChildNodes | Where-Object { $_.Name -eq 'Properties' } | Select-Object -First 1
                 if ($props) {
-                    $securityFinding = ''
-                    if ($n.cpassword) {
-                        $securityFinding = "Stored credentials detected - Password in SYSVOL (AES-encrypted)"
-                    }
+                    $securityFinding = Get-DriveSecurityFinding $n $props
+                    $hasCpassword = Test-CpasswordPresent $n $props
                     Add-Item 'Drives' @{
                         Domain=$domain; GPO=$gpo; Config=$config;
                         DriveLetter=$props.letter; Path=$props.path; Label=$props.label;
                         UserName=$props.userName; Persistent=$props.persistent; UseLetter=$props.useLetter;
-                        Action=$props.action; SecurityFinding=$securityFinding
+                        Action=$props.action; SecurityFinding=$securityFinding; HasCpassword=$hasCpassword
                     }
                 }
             }
@@ -295,27 +433,7 @@ foreach ($file in $xmlFiles) {
                 if ($null -eq $n) { continue }
                 $props = $n.Properties
                 if ($props) {
-                    $securityFinding = ''
-                    $regKey = $props.key.ToLower()
-                    $regName = $props.name.ToLower()
-                    # Detect insecure registry settings
-                    if ($regKey -match 'winlogon' -and $regName -eq 'autoadminlogon') {
-                        $securityFinding = 'Insecure: AutoAdminLogon enabled - cleartext password may be stored'
-                    } elseif ($regKey -match 'winlogon' -and $regName -eq 'defaultpassword') {
-                        $securityFinding = 'Insecure: Plaintext password stored in registry'
-                    } elseif ($regKey -match 'terminal' -and ($regName -match 'security' -or $regName -match 'nla')) {
-                        if ($props.value -eq '0') {
-                            $securityFinding = 'Insecure: RDP Network Level Authentication disabled'
-                        }
-                    } elseif ($regKey -match 'firewall' -and ($regName -match 'enabled' -or $regName -match 'firewall')) {
-                        if ($props.value -eq '0') {
-                            $securityFinding = 'Critical: Windows Firewall disabled'
-                        }
-                    } elseif ($regKey -match 'uac' -and $regName -match 'enableuac') {
-                        if ($props.value -eq '0') {
-                            $securityFinding = 'Critical: User Account Control (UAC) disabled'
-                        }
-                    }
+                    $securityFinding = Get-RegistrySecurityFinding $props
                     Add-Item 'Registry' @{
                         Domain=$domain; GPO=$gpo; Config=$config;
                         Hive=$props.hive; RegistryKey=$props.key; ValueName=$props.name;
@@ -331,10 +449,7 @@ foreach ($file in $xmlFiles) {
                 if ($null -eq $n) { continue }
                 $props = $n.Properties
                 if ($props) {
-                    $securityFinding = ''
-                    if ($n.cpassword) {
-                        $securityFinding = "Stored printer credentials detected - Password in SYSVOL (AES-encrypted)"
-                    }
+                    $securityFinding = Get-PrinterSecurityFinding $n $props
                     Add-Item 'Printers' @{
                         Domain=$domain; GPO=$gpo; Config=$config;
                         PrinterName=$n.name; Path=$props.path; Comment=$props.comment;
@@ -366,10 +481,7 @@ foreach ($file in $xmlFiles) {
                 if ($null -eq $n) { continue }
                 $props = $n.Properties
                 if ($props) {
-                    $securityFinding = ''
-                    if ($props.groupName -eq 'Administrators' -or $props.groupName -match 'Admin') {
-                        $securityFinding = "Local admin group managed via GPP - High privilege modification risk"
-                    }
+                    $securityFinding = Get-GroupSecurityFinding $props
                     $members = @()
                     if ($props.Members.Member) {
                         $members = @($props.Members.Member)
@@ -407,17 +519,15 @@ foreach ($file in $xmlFiles) {
                 if ($null -eq $u) { continue }
                 $props = $u.Properties
                 if ($props) {
-                    $securityFinding = ''
-                    if ($u.cpassword) {
-                        $securityFinding = "Local user with stored password in SYSVOL (AES-encrypted) - Credential exposure risk"
-                    }
+                    $securityFinding = Get-UserSecurityFinding $u $props
+                    $hasCpassword = Test-CpasswordPresent $u $props
                     Add-Item 'Users' @{
                         Domain=$domain; GPO=$gpo; Config=$config;
                         UserName=$props.userName; FullName=$props.fullName;
                         Description=$props.description; Action=$props.action;
                         NeverExpires=$props.neverExpires; AccountDisabled=$props.acctDisabled;
                         ChangeLogon=$props.changeLogon; NoChange=$props.noChange;
-                        Changed=$u.changed; SecurityFinding=$securityFinding
+                        Changed=$u.changed; SecurityFinding=$securityFinding; HasCpassword=$hasCpassword
                     }
                 }
             }
@@ -456,13 +566,7 @@ foreach ($file in $xmlFiles) {
                     if ($props.ACL -and $props.ACL.ACE) {
                         $aces = @($props.ACL.ACE)
                         foreach ($ace in $aces) {
-                            $securityFinding = ''
-                            $principal = $ace.principal.ToLower()
-                            $rights = $ace.rights.ToLower()
-                            # Detect overly permissive ACLs
-                            if (($principal -match 'everyone|authenticated users|system' -or $principal -eq 's-1-1-0') -and ($rights -match 'full|modify')) {
-                                $securityFinding = "Overly permissive ACL: $($ace.principal) has $($ace.rights) rights"
-                            }
+                            $securityFinding = Get-FolderAclSecurityFinding $ace
                             Add-Item 'FoldersACL' @{
                                 Domain=$domain; GPO=$gpo; Config=$config;
                                 FolderName=$n.name; FolderPath=$props.path;
@@ -512,16 +616,14 @@ foreach ($file in $xmlFiles) {
                 if ($null -eq $n) { continue }
                 $props = $n.Properties
                 if ($props) {
-                    $securityFinding = ''
-                    if ($n.cpassword) {
-                        $securityFinding = "ODBC stored credentials - Password in SYSVOL (AES-encrypted)"
-                    }
+                    $securityFinding = Get-DataSourceSecurityFinding $n $props
+                    $hasCpassword = Test-CpasswordPresent $n $props
                     Add-Item 'DataSources' @{
                         Domain=$domain; GPO=$gpo; Config=$config;
                         DataSourceName=$n.name; DSN=$props.dsn; Driver=$props.driver;
                         Description=$props.description; UserName=$props.username;
                         Action=$props.action; UserDSN=$props.userDSN; UserContext=$n.userContext;
-                        Changed=$n.changed; SecurityFinding=$securityFinding
+                        Changed=$n.changed; SecurityFinding=$securityFinding; HasCpassword=$hasCpassword
                     }
                 }
             }
@@ -703,7 +805,7 @@ foreach ($file in $xmlFiles) {
                         TriggerType=$triggerType; Command=$command;
                         Arguments=$arguments; WorkingDirectory=$workingDir;
                         Changed=$n.changed; UID=$n.uid;
-                        SecurityFinding = if ($n.cpassword) { "Scheduled task with stored credentials - Password in SYSVOL (AES-encrypted)" } else { '' }
+                        SecurityFinding = Get-TaskSecurityFinding $n $props; HasCpassword = (Test-CpasswordPresent $n $props)
                     }
                 }
             }
@@ -714,15 +816,15 @@ foreach ($file in $xmlFiles) {
                 if ($null -eq $n) { continue }
                 $props = $n.Properties
                 if ($props) {
-                    $securityFinding = ''
-                    if ($n.cpassword) {
-                        $securityFinding = "Service with stored credentials - Password in SYSVOL (AES-encrypted)"
-                    }
+                    $securityFinding = Get-ServiceSecurityFinding $n $props
+                    $hasCpassword = Test-CpasswordPresent $n $props
+                    $serviceUsername = $props.logonAsServiceAccount
                     Add-Item 'Services' @{
                         Domain=$domain; GPO=$gpo; Config=$config;
                         ServiceName=$props.serviceName; DisplayName=$n.name;
                         StartupType=$props.startupType; Timeout=$props.timeout;
-                        Changed=$n.changed; UID=$n.uid; Action=$n.action; SecurityFinding=$securityFinding
+                        AccountName=$serviceUsername;
+                        Changed=$n.changed; UID=$n.uid; Action=$n.action; SecurityFinding=$securityFinding; HasCpassword=$hasCpassword
                     }
                 }
             }
@@ -731,17 +833,27 @@ foreach ($file in $xmlFiles) {
             Add-Item 'OtherTypes' @{ Domain=$domain; GPO=$gpo; Config=$config; PreferenceType=$type; XmlPath=$file.FullName }
         }
     }
+    }
+    catch {
+        $script:ErrorCount++
+        Write-Warning "Error processing file $($file.FullName): $($_.Exception.Message)"
+    }
 }
+
+#endregion
+
+#region Export CSV Files
 
 Write-Host "" -ForegroundColor Cyan
 Write-Host "Exporting CSV files..." -ForegroundColor Cyan
 if ($ExportCSV) {
-    $csvFiles = @('Drives','Registry','Printers','Shortcuts','GroupsDetail','Groups','Users','Files','Folders','FoldersACL','IniFiles','NetworkShares','DataSources','Devices','EnvironmentVariables','InternetSettings','PowerOptions','FolderOptions','Services','ScheduledTasks','OtherTypes')
-    $totalCsvFiles = $csvFiles.Count
-    
-    $csvIndex = 0
-    foreach ($csvType in $csvFiles) {
-        $csvIndex++
+    try {
+        $csvFiles = @('Drives','Registry','Printers','Shortcuts','GroupsDetail','Groups','Users','Files','Folders','FoldersACL','IniFiles','NetworkShares','DataSources','Devices','EnvironmentVariables','InternetSettings','PowerOptions','FolderOptions','Services','ScheduledTasks','OtherTypes')
+        $totalCsvFiles = $csvFiles.Count
+        
+        $csvIndex = 0
+        foreach ($csvType in $csvFiles) {
+            $csvIndex++
         $csvFileName = switch($csvType) {
             'Drives' { 'GPP_DriveMapping_Details.csv' }
             'Registry' { 'GPP_Registry_Details.csv' }
@@ -766,14 +878,29 @@ if ($ExportCSV) {
             'OtherTypes' { 'GPP_OtherTypes.csv' }
         }
         
-        Show-ProgressBar $csvIndex $totalCsvFiles "Exporting:"
-        $results[$csvType] | Export-Csv -Path (Join-Path $OutputDir $csvFileName) -NoTypeInformation -Encoding UTF8
+            Show-ProgressBar $csvIndex $totalCsvFiles "Exporting:"
+            try {
+                $results[$csvType] | Export-Csv -Path (Join-Path $OutputDir $csvFileName) -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+            }
+            catch {
+                $script:ErrorCount++
+                Write-Warning "Failed to export CSV for $csvType`: $($_.Exception.Message)"
+            }
+        }
+        Write-Host "" -ForegroundColor Cyan
+        Write-Host "CSV export completed!" -ForegroundColor Green
     }
-    Write-Host "" -ForegroundColor Cyan
-    Write-Host "CSV export completed!" -ForegroundColor Green
+    catch {
+        $script:ErrorCount++
+        Write-Error "CSV export failed: $($_.Exception.Message)"
+    }
 } else {
     Write-Host "Skipping CSV export (disabled)" -ForegroundColor Yellow
 }
+
+#endregion
+
+#region Calculate Statistics
 
 # Calculate overview statistics and preference type distribution for both JSON and HTML
 $allRecords = @()
@@ -889,11 +1016,16 @@ $summary = @(
 
 $totalRecords = (($summary | ForEach-Object { $_.Data.Count }) | Measure-Object -Sum).Sum
 
+#endregion
+
+#region Export JSON
+
 if ($ExportJSON) {
-    Write-Host "" -ForegroundColor Cyan
-    Write-Host "Exporting JSON data..." -ForegroundColor Cyan
-    $jsonFileName = "GPP_Complete_Data_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
-    $jsonPath = Join-Path $OutputDir $jsonFileName
+    try {
+        Write-Host "" -ForegroundColor Cyan
+        Write-Host "Exporting JSON data..." -ForegroundColor Cyan
+        $jsonFileName = "GPP_Complete_Data_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+        $jsonPath = Join-Path $OutputDir $jsonFileName
     
     # Build comprehensive JSON structure with metadata, overview, distribution, and raw data
     $jsonData = [ordered]@{
@@ -930,13 +1062,24 @@ if ($ExportJSON) {
         PreferenceData = $results
     }
     
-    $jsonData | ConvertTo-Json -Depth 10 | Out-File $jsonPath -Encoding UTF8
-    Write-Host "JSON export completed: $jsonPath" -ForegroundColor Green
+        $jsonData | ConvertTo-Json -Depth 10 -ErrorAction Stop | Out-File $jsonPath -Encoding UTF8 -ErrorAction Stop
+        Write-Host "JSON export completed: $jsonPath" -ForegroundColor Green
+    }
+    catch {
+        $script:ErrorCount++
+        Write-Error "JSON export failed: $($_.Exception.Message)"
+    }
 } else {
     Write-Host "Skipping JSON export (disabled)" -ForegroundColor Yellow
 }
 
+#endregion
+
+#region Generate HTML Report
+
 Write-Host "Generating HTML report..." -ForegroundColor Cyan
+
+try {
 
 function Build-Section($title,$id,$data,$columns,$filterId,$tableId) {
     if (-not $data -or $data.Count -eq 0) { return '' }
@@ -1009,6 +1152,49 @@ function Build-SubSection($title,$data,$columns,$filterId,$tableId) {
     return $sb.ToString()
 }
 
+function Build-RiskyGroupedSection($data) {
+    if (-not $data -or $data.Count -eq 0) { return "<p>No risky configurations detected.</p>" }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append("<div style='max-width:100%;'>")
+    $grouped = $data | Group-Object SecurityFinding
+    foreach ($group in ($grouped | Sort-Object @{ Expression = { $_.Name -notmatch 'stored credentials' }; Ascending = $true }, @{ Expression = 'Name'; Ascending = $true })) {
+        $finding = EncodeHtml $group.Name
+        [void]$sb.Append("<details><summary>$finding <span style='color:#106ebe;font-size:14px;'>($($group.Count))</span></summary>")
+        [void]$sb.Append("<div class='section'>")
+        
+        # Check if any row in this group has a cpassword value
+        # Also skip cpassword column for ACL and admin group findings
+        $isCpasswordNeeded = ($group.Group | Where-Object { $_.HasCpassword -eq $true } | Measure-Object | Select-Object -ExpandProperty Count) -gt 0
+        $isAclOrAdminFinding = $group.Name -match 'permissive ACL|admin group'
+        $hasCpasswordColumn = $isCpasswordNeeded -and -not $isAclOrAdminFinding
+        
+        # Build header with or without cpassword column
+        if ($hasCpasswordColumn) {
+            [void]$sb.Append("<table><tr><th>Domain</th><th>GPO</th><th>Type</th><th>Item</th><th>UserName</th><th>Has cpassword</th></tr>")
+        } else {
+            [void]$sb.Append("<table><tr><th>Domain</th><th>GPO</th><th>Type</th><th>Item</th><th>UserName</th></tr>")
+        }
+        
+        foreach ($row in $group.Group) {
+            $domain = EncodeHtml $row.Domain
+            $gpo = EncodeHtml $row.GPO
+            $type = EncodeHtml $row.Type
+            $item = EncodeHtml $row.Item
+            $username = EncodeHtml $row.UserName
+            
+            if ($hasCpasswordColumn) {
+                $hasCpassword = if ($row.HasCpassword -eq $true) { 'Yes' } elseif ($row.HasCpassword -eq $false) { 'No' } else { '' }
+                [void]$sb.Append("<tr><td>$domain</td><td>$gpo</td><td>$type</td><td>$item</td><td>$username</td><td>$hasCpassword</td></tr>")
+            } else {
+                [void]$sb.Append("<tr><td>$domain</td><td>$gpo</td><td>$type</td><td>$item</td><td>$username</td></tr>")
+            }
+        }
+        [void]$sb.Append("</table></div></details>")
+    }
+    [void]$sb.Append("</div>")
+    return $sb.ToString()
+}
+
 $report = Join-Path $OutputDir "Group Policy Preferences Report_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
 
 $html = @"
@@ -1075,73 +1261,187 @@ $html += @"
 <h1>Details</h1>
 "@
 
-$html += Build-Section 'Drive Mappings' 'drives' $results.Drives @('Domain','GPO','Config','DriveLetter','Path','Label','UserName','Action','SecurityFinding') 'driveFilter' 'driveTable'
-$html += Build-Section 'Registry Settings' 'registry' $results.Registry @('Domain','GPO','Config','Hive','RegistryKey','ValueName','ValueData','ValueType','Action','DisplayDecimal','SecurityFinding') 'regFilter' 'regTable'
+$html += Build-Section 'Drive Mappings' 'drives' $results.Drives @('Domain','GPO','Config','DriveLetter','Path','Label','UserName','Action','HasCpassword','SecurityFinding') 'driveFilter' 'driveTable'
+# Filter out DefaultPassword/DefaultUserName from Registry display (they're merged in Risky Configs)
+$registryForDisplay = @($results.Registry | Where-Object {
+    $valueName = $_.ValueName | ForEach-Object { $_.ToLower() }
+    -not ($_.RegistryKey -match 'winlogon' -and ($valueName -eq 'defaultpassword' -or $valueName -eq 'defaultusername'))
+})
+$html += Build-Section 'Registry Settings' 'registry' $registryForDisplay @('Domain','GPO','Config','Hive','RegistryKey','ValueName','ValueData','ValueType','Action','DisplayDecimal','SecurityFinding') 'regFilter' 'regTable'
 $html += Build-Section 'Printers' 'printers' $results.Printers @('Domain','GPO','Config','PrinterName','Path','Comment','Location','Port','Action','SecurityFinding') 'printerFilter' 'printerTable'
 $html += Build-Section 'Shortcuts' 'shortcuts' $results.Shortcuts @('Domain','GPO','Config','ShortcutName','TargetPath','ShortcutPath','Arguments','Comment','TargetType','Action') 'shortcutFilter' 'shortcutTable'
 $html += Build-Section 'Local Groups' 'groups' $results.Groups @('Domain','GPO','Config','GroupName','GroupAction','MemberName','MemberAction','MemberSID','Description','SecurityFinding') 'groupsFilter' 'groupsTable'
-$html += Build-Section 'Local Users' 'users' $results.Users @('Domain','GPO','Config','UserName','FullName','Description','Action','NeverExpires','AccountDisabled','SecurityFinding') 'usersFilter' 'usersTable'
+$html += Build-Section 'Local Users' 'users' $results.Users @('Domain','GPO','Config','UserName','FullName','Description','Action','NeverExpires','AccountDisabled','HasCpassword','SecurityFinding') 'usersFilter' 'usersTable'
 $html += Build-Section 'Files' 'files' $results.Files @('Domain','GPO','Config','FileName','SourcePath','TargetPath','Action','ReadOnly','Archive','Hidden','Suppress','Changed') 'filesFilter' 'filesTable'
 $html += Build-Section 'Folders' 'folders' $results.Folders @('Domain','GPO','Config','FolderName','FolderPath','Action','DeleteFolder','DeleteSubFolders','DeleteFiles','DeleteReadOnly','Archive','Hidden','Changed') 'foldersFilter' 'foldersTable'
 $html += Build-Section 'Folders ACL' 'foldersacl' $results.FoldersACL @('Domain','GPO','Config','FolderName','FolderPath','Principal','ACEType','Rights','Inheritance','FolderAction','SecurityFinding') 'folderaclFilter' 'folderaclTable'
 $html += Build-Section 'INI Files' 'inifiles' $results.IniFiles @('Domain','GPO','Config','IniName','IniPath','Section','Property','Value','Action','Changed') 'inifilesFilter' 'inifilesTable'
 $html += Build-Section 'Network Shares' 'networkshares' $results.NetworkShares @('Domain','GPO','Config','ShareName','SharePath','Comment','Action','AllRegular','AllHidden','AllAdminDrive','LimitUsers','ABE','Changed') 'networksharesFilter' 'networksharesTable'
-$html += Build-Section 'Data Sources' 'datasources' $results.DataSources @('Domain','GPO','Config','DataSourceName','DSN','Driver','Description','UserName','Action','SecurityFinding') 'datasourcesFilter' 'datasourcesTable'
+$html += Build-Section 'Data Sources' 'datasources' $results.DataSources @('Domain','GPO','Config','DataSourceName','DSN','Driver','Description','UserName','Action','HasCpassword','SecurityFinding') 'datasourcesFilter' 'datasourcesTable'
 $html += Build-Section 'Devices' 'devices' $results.Devices @('Domain','GPO','Config','DeviceName','DeviceAction','DeviceClass','DeviceType','DeviceClassGUID','DeviceTypeID','UserContext','RemovePolicy','Changed') 'devicesFilter' 'devicesTable'
 $html += Build-Section 'Environment Variables' 'env' $results.EnvironmentVariables @('Domain','GPO','Config','VariableName','VariableValue','Action','User','Partial','RemovePolicy','BypassErrors','Changed') 'envFilter' 'envTable'
 $html += Build-Section 'Internet Settings' 'inet' $results.InternetSettings @('Domain','GPO','Config','IEVersion','SettingId','SettingName','RegistryKey','ValueType','Value','Disabled') 'inetFilter' 'inetTable'
-$html += Build-Section 'Scheduled Tasks' 'tasks' $results.ScheduledTasks @('Domain','GPO','Config','TaskName','Action','Author','Description','RunAs','Enabled','TriggerType','Command','SecurityFinding') 'tasksFilter' 'tasksTable'
+$html += Build-Section 'Scheduled Tasks' 'tasks' $results.ScheduledTasks @('Domain','GPO','Config','TaskName','Action','Author','Description','RunAs','Enabled','TriggerType','Command','HasCpassword','SecurityFinding') 'tasksFilter' 'tasksTable'
 $html += Build-Section 'Power Options' 'power' $results.PowerOptions @('Domain','GPO','Config','PowerPlanName','DefaultPlan','SleepAfterAC','SleepAfterDC','HibernateAC','HibernateDC','DisplayOffAC','DisplayOffDC','LidCloseAC','LidCloseDC','ProcStateMinAC','ProcStateMinDC','Changed') 'powerFilter' 'powerTable'
 $html += Build-Section 'Folder Options' 'folderopts' $results.FolderOptions @('Domain','GPO','Config','OpenWithName','FileExtension','ApplicationPath','Action','Default','UserContext','RemovePolicy','Changed') 'folderoptFilter' 'folderoptTable'
-$html += Build-Section 'Services' 'services' $results.Services @('Domain','GPO','Config','ServiceName','DisplayName','StartupType','Timeout','Action','SecurityFinding') 'servicesFilter' 'servicesTable'
+$html += Build-Section 'Services' 'services' $results.Services @('Domain','GPO','Config','ServiceName','DisplayName','StartupType','Timeout','AccountName','Action','HasCpassword','SecurityFinding') 'servicesFilter' 'servicesTable'
 $html += Build-Section 'Other Types' 'other' $results.OtherTypes @('Domain','GPO','Config','PreferenceType','XmlPath','Note') 'otherFilter' 'otherTable'
 
 # Aggregate all risky configurations
 $riskyConfigsList = @()
+$registryItems = @()
+$mergedRegistryItems = @()
+
+# First, collect registry items to potentially merge DefaultPassword and DefaultUserName
 @($results.Drives, $results.Registry, $results.Printers, $results.Groups, $results.GroupsDetail, $results.Users, $results.DataSources, $results.FoldersACL, $results.ScheduledTasks, $results.Services) | ForEach-Object {
-    $riskyConfigsList += @($_ | Where-Object { $_.SecurityFinding -and $_.SecurityFinding -ne '' } | ForEach-Object {
-        $type = ''
-        if ($_ -in $results.Drives) { $type = 'Drive Mapping' }
-        elseif ($_ -in $results.Registry) { $type = 'Registry' }
-        elseif ($_ -in $results.Printers) { $type = 'Printer' }
-        elseif ($_ -in $results.Groups) { $type = 'Group Member' }
-        elseif ($_ -in $results.GroupsDetail) { $type = 'Group' }
-        elseif ($_ -in $results.Users) { $type = 'User' }
-        elseif ($_ -in $results.DataSources) { $type = 'DataSource' }
-        elseif ($_ -in $results.FoldersACL) { $type = 'Folder ACL' }
-        elseif ($_ -in $results.ScheduledTasks) { $type = 'Scheduled Task' }
-        elseif ($_ -in $results.Services) { $type = 'Service' }
-        
-        $itemName = ''
-        if ($_.DriveLetter) { $itemName = $_.DriveLetter }
-        elseif ($_.RegistryKey) { $itemName = "$($_.RegistryKey)\$($_.ValueName)" }
-        elseif ($_.PrinterName) { $itemName = $_.PrinterName }
-        elseif ($_.GroupName) { $itemName = if ($_.MemberName) { "$($_.GroupName) / $($_.MemberName)" } else { $_.GroupName } }
-        elseif ($_.UserName) { $itemName = $_.UserName }
-        elseif ($_.DataSourceName) { $itemName = $_.DataSourceName }
-        elseif ($_.FolderName) { $itemName = "$($_.FolderName) / $($_.Principal)" }
-        elseif ($_.TaskName) { $itemName = $_.TaskName }
-        elseif ($_.ServiceName) { $itemName = $_.ServiceName }
-        
-        [pscustomobject]@{
-            Domain = $_.Domain
-            GPO = $_.GPO
-            Type = $type
-            Item = $itemName
-            SecurityFinding = $_.SecurityFinding
+    $_ | Where-Object { $_.SecurityFinding -and $_.SecurityFinding -ne '' -and $_.SecurityFinding -notmatch 'Windows Firewall' } | ForEach-Object {
+        if ($_ -in $results.Registry) {
+            $registryItems += $_
+        } else {
+            $type = ''
+            if ($_ -in $results.Drives) { $type = 'Drive Mapping' }
+            elseif ($_ -in $results.Printers) { $type = 'Printer' }
+            elseif ($_ -in $results.Groups) { $type = 'Group Member' }
+            elseif ($_ -in $results.GroupsDetail) { $type = 'Group' }
+            elseif ($_ -in $results.Users) { $type = 'User' }
+            elseif ($_ -in $results.DataSources) { $type = 'DataSource' }
+            elseif ($_ -in $results.FoldersACL) { $type = 'Folder ACL' }
+            elseif ($_ -in $results.ScheduledTasks) { $type = 'Scheduled Task' }
+            elseif ($_ -in $results.Services) { $type = 'Service' }
+            
+            $itemName = ''
+            $username = ''
+            $hasCpassword = ''
+            
+            if ($_.DriveLetter) { 
+                $itemName = $_.DriveLetter
+                $username = $_.UserName
+                $hasCpassword = $_.HasCpassword
+            }
+            elseif ($_.PrinterName) { $itemName = $_.PrinterName }
+            elseif ($_.GroupName) { $itemName = if ($_.MemberName) { "$($_.GroupName) / $($_.MemberName)" } else { $_.GroupName } }
+            elseif ($_.DataSourceName) { 
+                $itemName = $_.DataSourceName
+                $username = $_.UserName
+                $hasCpassword = $_.HasCpassword
+            }
+            elseif ($_.UserName) { 
+                $itemName = $_.UserName
+                $hasCpassword = $_.HasCpassword
+            }
+            elseif ($_.FolderName) { $itemName = "$($_.FolderName) / $($_.Principal)" }
+            elseif ($_.TaskName) { 
+                $itemName = $_.TaskName
+                $username = $_.RunAs
+                $hasCpassword = $_.HasCpassword
+            }
+            elseif ($_.ServiceName) { 
+                $itemName = $_.ServiceName
+                $username = $_.AccountName
+                $hasCpassword = $_.HasCpassword
+            }
+            
+            $riskyConfigsList += [pscustomobject]@{
+                Domain = $_.Domain
+                GPO = $_.GPO
+                Type = $type
+                Item = $itemName
+                UserName = $username
+                HasCpassword = $hasCpassword
+                SecurityFinding = $_.SecurityFinding
+            }
         }
-    })
+    }
 }
 
-$html += Build-Section 'Risky Configurations' 'risky' $riskyConfigsList @('Domain','GPO','Type','Item','SecurityFinding') 'riskyFilter' 'riskyTable'
+# Process registry items and merge DefaultPassword/DefaultUserName
+$regByKey = $registryItems | Group-Object { "$($_.Domain)_$($_.GPO)_$($_.RegistryKey)" }
+foreach ($group in $regByKey) {
+    $defaultPass = $group.Group | Where-Object { $_.ValueName -eq 'DefaultPassword' }
+    $defaultUser = $group.Group | Where-Object { $_.ValueName -eq 'DefaultUserName' }
+    
+    if ($defaultPass -and $defaultUser) {
+        # Both exist - merge them
+        $userValue = $defaultUser[0].ValueData
+        $passValue = $defaultPass[0].ValueData
+        # Check if DefaultPassword has a non-empty value
+        $hasPassword = -not [string]::IsNullOrWhiteSpace($passValue)
+        $finding = "Insecure: Plaintext credentials in registry (DefaultUserName and DefaultPassword)"
+        $mergedRegistryItems += [pscustomobject]@{
+            Domain = $defaultPass[0].Domain
+            GPO = $defaultPass[0].GPO
+            Type = 'Registry'
+            Item = $defaultPass[0].RegistryKey
+            UserName = $userValue
+            HasCpassword = $hasPassword
+            SecurityFinding = $finding
+        }
+    } else {
+        # Process individually
+        $group.Group | ForEach-Object {
+            $riskyConfigsList += [pscustomobject]@{
+                Domain = $_.Domain
+                GPO = $_.GPO
+                Type = 'Registry'
+                Item = "$($_.RegistryKey)\$($_.ValueName)"
+                UserName = ''
+                HasCpassword = $false
+                SecurityFinding = $_.SecurityFinding
+            }
+        }
+    }
+}
+
+# Add merged registry items to the list
+$riskyConfigsList += $mergedRegistryItems
 
 $html += @"
 </div>
+
+<div class='main-section'>
+<h1>Risky Configurations</h1>
+"@
+
+$html += Build-RiskyGroupedSection $riskyConfigsList
+
+$html += @"
+</div>
+
 </div>
 </body></html>
 "@
-$html | Out-File $report -Encoding UTF8
-Write-Host "HTML report generation completed!" -ForegroundColor Green
-Write-Host "Report generated at: $report" -ForegroundColor Green
+    $html | Out-File $report -Encoding UTF8 -ErrorAction Stop
+    Write-Host "HTML report generation completed!" -ForegroundColor Green
+    Write-Host "Report generated at: $report" -ForegroundColor Green
+}
+catch {
+    $script:ErrorCount++
+    Write-Error "HTML report generation failed: $($_.Exception.Message)"
+    exit 1
+}
+
+#endregion
+
+#region Summary and Completion
+
 Write-Host "" -ForegroundColor Green
 Write-Host "✓ Processing complete!" -ForegroundColor Green
+
+if ($script:ErrorCount -gt 0) {
+    Write-Host "⚠ Completed with $($script:ErrorCount) error(s)" -ForegroundColor Yellow
+}
+if ($script:WarningCount -gt 0) {
+    Write-Host "⚠ Completed with $($script:WarningCount) warning(s)" -ForegroundColor Yellow
+}
+
+Write-Host "" -ForegroundColor Cyan
+Write-Host "Summary:" -ForegroundColor Cyan
+Write-Host "  Total files processed: $totalFiles" -ForegroundColor White
+Write-Host "  Total records collected: $totalRecords" -ForegroundColor White
+Write-Host "  Errors encountered: $($script:ErrorCount)" -ForegroundColor $(if ($script:ErrorCount -gt 0) { 'Yellow' } else { 'Green' })
+
+if ($script:ErrorCount -gt 0) {
+    exit 1
+}
+
+#endregion
